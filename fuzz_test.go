@@ -88,3 +88,9 @@ func FuzzOpenStore(f *testing.F) {
 		_ = err
 	})
 }
+
+func FuzzDecodeCommitRoot(f *testing.F) {
+	f.Add(encodeRoot(commitRoot{header: header{ChunkSize: minimumChunkSize}, generation: 1, offset: dataStart}))
+	f.Add([]byte("incomplete commit"))
+	f.Fuzz(func(t *testing.T, data []byte) { _, _ = decodeRoot(data) })
+}

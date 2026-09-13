@@ -1,6 +1,8 @@
 package sandboxed
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,13 +19,15 @@ import (
 // Store is a mutable filesystem backed by one binary file. Store implements
 // fs.FS, fs.ReadFileFS, fs.ReadDirFS, and fs.StatFS.
 type Store struct {
-	path      string
-	chunkSize int
-	key       []byte
-	fileMode  fs.FileMode
-	manifest  manifest
-	lock      sync.RWMutex
-	fileLock  *flock.Flock
+	path         string
+	chunkSize    int
+	key          []byte
+	fileMode     fs.FileMode
+	manifest     manifest
+	generation   uint64
+	committedEnd int64
+	lock         sync.RWMutex
+	fileLock     *flock.Flock
 }
 
 // Compilation-time check that we are indeed implementing these interfaces
@@ -65,7 +69,7 @@ func OpenStore(filename string, options ...Option) (*Store, error) {
 	_, err = os.Stat(filename)
 	if errors.Is(err, os.ErrNotExist) {
 		store.manifest = manifest{Entries: map[string]entry{".": {Directory: true}}}
-		if err := store.rewrite(nil); err != nil {
+		if err := store.rewrite(context.Background()); err != nil {
 			return nil, err
 		}
 		return store, nil
@@ -73,6 +77,7 @@ func OpenStore(filename string, options ...Option) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	store.chunkSize = 0
 	if err := store.load(); err != nil {
 		return nil, err
 	}
@@ -112,7 +117,7 @@ func (s *Store) Mkdir(name string) error {
 		return &fs.PathError{Op: "mkdir", Path: name, Err: fs.ErrNotExist}
 	}
 	s.manifest.Entries[name] = entry{Directory: true}
-	if err := s.rewrite(nil); err != nil {
+	if err := s.commit(nil); err != nil {
 		delete(s.manifest.Entries, name)
 		return err
 	}
@@ -171,7 +176,7 @@ func (s *Store) Remove(name string) error {
 		}
 	}
 	delete(s.manifest.Entries, name)
-	if err := s.rewrite(nil); err != nil {
+	if err := s.commit(nil); err != nil {
 		s.manifest.Entries[name] = item
 		return err
 	}
@@ -184,17 +189,17 @@ func (s *Store) WriteFile(name string, reader io.Reader) error {
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(output, reader)
-	if copyErr != nil {
-		if pending, ok := output.(*writer); ok {
-			pending.err = copyErr
-		}
+	defer output.Abort()
+
+	// Buffer small reads so streaming replacements encrypt a chunk at a time.
+	buffered := bufio.NewWriterSize(output, s.chunkSize)
+	if _, err := io.Copy(buffered, reader); err != nil {
+		return err
 	}
-	closeErr := output.Close()
-	if copyErr != nil {
-		return copyErr
+	if err := buffered.Flush(); err != nil {
+		return err
 	}
-	return closeErr
+	return output.Close()
 }
 
 // ReadFile reads a complete file. Use Open and io.Copy for bounded-memory reads.

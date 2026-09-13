@@ -28,7 +28,7 @@ func TestHeaderUsesStructuredIdentifier(t *testing.T) {
 	if !bytes.Equal(headerBytes[11:14], []byte{0, 0, 0}) {
 		t.Fatalf("reserved bytes = %v", headerBytes[11:14])
 	}
-	if version := binary.BigEndian.Uint16(headerBytes[14:16]); version != formatVersion {
+	if version := binary.BigEndian.Uint16(headerBytes[14:16]); version != 1 {
 		t.Fatalf("format version = %d", version)
 	}
 }
@@ -270,11 +270,7 @@ func TestTamperedChunkFailsAuthentication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	header, err := decodeHeader(raw[:headerSize])
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw[headerSize+int(header.ManifestLen)] ^= 0xff
+	raw[store.manifest.Entries["file"].Chunks[0].Offset] ^= 0xff
 	if err := os.WriteFile(filename, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -618,5 +614,20 @@ func TestIndependentStoresSerializeConcurrentMutations(t *testing.T) {
 
 	if _, err := os.Stat(filename + ".lock"); err != nil {
 		t.Fatalf("coordination lock file: %v", err)
+	}
+}
+
+func TestStoreRejectsUnsupportedFormatVersions(t *testing.T) {
+	store := testStore(t)
+	original := blob(t, store)
+	for _, version := range []uint16{0, 2, 65535} {
+		raw := append([]byte(nil), original...)
+		binary.BigEndian.PutUint16(raw[14:16], version)
+		if err := os.WriteFile(store.path, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenStore(store.path); err == nil {
+			t.Fatalf("accepted format version %d", version)
+		}
 	}
 }

@@ -1,67 +1,88 @@
 package sandboxed
 
 import (
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 )
 
 func (s *Store) load() error {
-	// Open a stable snapshot of the current blob.
 	file, err := os.Open(s.path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-
-	// Decode the header and bound the manifest before allocating for it.
-	headerBytes := make([]byte, headerSize)
-	if _, err := io.ReadFull(file, headerBytes); err != nil {
+	buffer := make([]byte, headerSize)
+	if _, err := io.ReadFull(file, buffer); err != nil {
 		return fmt.Errorf("read store header: %w", err)
 	}
-
-	value, err := decodeHeader(headerBytes)
+	h, err := decodeHeader(buffer)
 	if err != nil {
 		return err
 	}
-
+	if s.chunkSize == 0 {
+		s.chunkSize = int(h.ChunkSize)
+	} else if s.chunkSize != int(h.ChunkSize) {
+		return fmt.Errorf("store chunk size changed")
+	}
 	info, err := file.Stat()
 	if err != nil {
 		return err
 	}
-	if value.ManifestLen > uint64(info.Size()-headerSize) {
-		return fmt.Errorf("invalid manifest length")
-	}
-	if value.ManifestLen > maxManifestSize {
-		return fmt.Errorf("manifest exceeds maximum size")
-	}
 
-	// Authenticate, decode, and validate all metadata before publishing it.
-	encoded := make([]byte, value.ManifestLen)
-	if _, err := io.ReadFull(file, encoded); err != nil {
-		return fmt.Errorf("read store manifest: %w", err)
+	// Only torn root records permit fallback. A published but corrupt manifest
+	// is an error, never an invitation to silently roll back committed data.
+	var latest commitRoot
+	for slot := int64(1); slot <= 2; slot++ {
+		buffer := make([]byte, rootSize)
+		if _, err := file.ReadAt(buffer, slot*rootSpacing); err != nil {
+			continue
+		}
+		root, err := decodeRoot(buffer)
+		if err == nil && root.generation > latest.generation {
+			latest = root
+		}
 	}
-
-	result, err := unmarshalManifest(value, encoded, s.key)
+	if latest.generation == 0 {
+		return fmt.Errorf("store has no complete commit")
+	}
+	if latest.header.Flags != h.Flags || latest.header.ChunkSize != h.ChunkSize || latest.offset < dataStart {
+		return fmt.Errorf("commit does not match store header")
+	}
+	result, err := readManifest(file, latest.header, latest.offset, info.Size(), s.key, latest.digest)
 	if err != nil {
 		return err
 	}
-	if value.Flags&flagManifestAES == 0 && len(s.key) != 0 {
-		return fmt.Errorf("store is not manifest-encrypted")
-	}
-	if err := validateManifest(result, info.Size()-headerSize-int64(value.ManifestLen), int(value.ChunkSize)); err != nil {
+	if err := validateManifest(result, latest.offset, int(h.ChunkSize)); err != nil {
 		return err
 	}
-
-	// Publish the complete validated manifest together.
-	s.chunkSize = int(value.ChunkSize)
-	s.manifest = result
-
+	s.manifest, s.generation = result, latest.generation
+	s.committedEnd = latest.offset + int64(latest.header.ManifestLen)
 	return nil
+}
+
+func readManifest(file *os.File, h header, offset, size int64, key []byte, digest [32]byte) (manifest, error) {
+	if offset < 0 || offset > size || h.ManifestLen > maxManifestSize || h.ManifestLen > uint64(size-offset) {
+		return manifest{}, fmt.Errorf("invalid manifest length")
+	}
+	if h.Flags&flagManifestAES == 0 && len(key) != 0 {
+		return manifest{}, fmt.Errorf("store is not manifest-encrypted")
+	}
+	encoded := make([]byte, h.ManifestLen)
+	if _, err := file.ReadAt(encoded, offset); err != nil {
+		return manifest{}, fmt.Errorf("read store manifest: %w", err)
+	}
+	if sha256.Sum256(encoded) != digest {
+		return manifest{}, fmt.Errorf("store manifest checksum mismatch")
+	}
+	return unmarshalManifest(h, encoded, key)
 }
 
 // lockLatest serializes this Store with every other Store and process using the
@@ -110,20 +131,33 @@ func validateManifest(value manifest, dataSize int64, chunkSize int) error {
 			return fmt.Errorf("store manifest contains invalid path %q", name)
 		}
 
+		if name != "." {
+			parent, exists := value.Entries[path.Dir(name)]
+			if !exists || !parent.Directory {
+				return fmt.Errorf("file %q has no parent directory", name)
+			}
+		}
+
 		if item.Directory {
-			if item.Size != 0 || len(item.Key) != 0 || len(item.Chunks) != 0 {
+			if item.Size != 0 || len(item.Key) != 0 || len(item.Chunks) != 0 || len(item.Revision) != 0 {
 				return fmt.Errorf("directory %q contains file data", name)
 			}
 			continue
 		}
 
-		if len(item.Key) != 32 || item.Size < 0 {
+		if len(item.Key) != 32 || item.Size < 0 || (len(item.Revision) != 0 && len(item.Revision) != 32) {
 			return fmt.Errorf("file %q has invalid metadata", name)
 		}
 
 		var size int64
-		for _, part := range item.Chunks {
-			if part.Offset < 0 || part.Size < 0 || part.Size > chunkSize {
+		for index, part := range item.Chunks {
+			if len(part.ID) != 32 {
+				return fmt.Errorf("invalid chunk identity")
+			}
+			if part.Offset < dataStart || (index < len(item.Chunks)-1 && part.Size != chunkSize) {
+				return fmt.Errorf("invalid chunk layout")
+			}
+			if part.Offset < 0 || part.Size <= 0 || part.Size > chunkSize {
 				return fmt.Errorf("file %q has invalid chunk metadata", name)
 			}
 
@@ -144,154 +178,196 @@ func validateManifest(value manifest, dataSize int64, chunkSize int) error {
 		}
 	}
 
-	// Generated blobs pack every ciphertext chunk exactly once without gaps.
+	// Live ciphertext ranges must never overlap.
 	sort.Slice(ranges, func(i, j int) bool { return ranges[i].start < ranges[j].start })
 
 	expectedOffset := int64(0)
 	for _, chunkRange := range ranges {
-		if chunkRange.start != expectedOffset {
-			return fmt.Errorf("store manifest contains overlapping or missing chunk data")
+		if chunkRange.start < expectedOffset {
+			return fmt.Errorf("store manifest contains overlapping chunk data")
 		}
 		expectedOffset = chunkRange.end
-	}
-	if expectedOffset != dataSize {
-		return fmt.Errorf("store manifest does not reference all chunk data")
 	}
 
 	return nil
 }
 
-func (s *Store) rewrite(replacement *pendingFile) error {
-	// Preserve source offsets and build an independent destination manifest.
-	sourceEntries := make(map[string]entry, len(s.manifest.Entries))
-	destination := manifest{Entries: make(map[string]entry, len(s.manifest.Entries))}
-
-	for name, item := range s.manifest.Entries {
-		copyItem := item
-		copyItem.Chunks = append([]chunk(nil), item.Chunks...)
-		sourceEntries[name] = copyItem
-
-		destinationItem := item
-		destinationItem.Key = append([]byte(nil), item.Key...)
-		destinationItem.Chunks = append([]chunk(nil), item.Chunks...)
-		destination.Entries[name] = destinationItem
+// commit appends only staged ciphertext and a complete metadata snapshot.
+// The caller holds the process lock and has loaded the latest committed state.
+func (s *Store) commit(replacement *pendingFile) error {
+	file, err := os.OpenFile(s.path, os.O_RDWR, 0)
+	if err != nil {
+		return err
 	}
+	defer file.Close()
 
-	// Calculate deterministic chunk ordering and destination offsets.
-	names := make([]string, 0, len(destination.Entries))
-	for name, item := range destination.Entries {
-		if !item.Directory {
-			names = append(names, name)
-		}
+	// Discard only uncommitted tails left by a failed append.
+	if err := file.Truncate(s.committedEnd); err != nil {
+		return err
 	}
-	sort.Strings(names)
-
-	var offset int64
-	for _, name := range names {
-		item := destination.Entries[name]
-		for index := range item.Chunks {
+	if _, err := file.Seek(s.committedEnd, io.SeekStart); err != nil {
+		return err
+	}
+	destination := cloneManifest(s.manifest)
+	if replacement != nil {
+		item := destination.Entries[replacement.name]
+		for index, part := range item.Chunks {
+			sourcePart, staged := replacement.chunks[index]
+			if replacement.chunks == nil {
+				sourcePart, staged = part, true
+			}
+			if !staged {
+				continue
+			}
+			offset, err := file.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return err
+			}
+			if _, err := io.CopyN(file, io.NewSectionReader(replacement.file, sourcePart.Offset, int64(part.Size+16)), int64(part.Size+16)); err != nil {
+				return fmt.Errorf("append chunk: %w", err)
+			}
 			item.Chunks[index].Offset = offset
-			offset += int64(item.Chunks[index].Size + 16)
 		}
-		destination.Entries[name] = item
+		destination.Entries[replacement.name] = item
 	}
+	root, err := s.publish(file, destination, s.generation+1)
+	if err != nil {
+		return err
+	}
+	s.manifest, s.generation, s.committedEnd = destination, root.generation, root.offset+int64(root.header.ManifestLen)
+	return nil
+}
 
-	// Create the replacement blob and write its header and manifest.
+func cloneManifest(source manifest) manifest {
+	result := manifest{Entries: make(map[string]entry, len(source.Entries))}
+	for name, item := range source.Entries {
+		item.Chunks = append([]chunk(nil), item.Chunks...)
+		result.Entries[name] = item
+	}
+	return result
+}
+
+// publish syncs payload and metadata before replacing the older commit slot.
+// A final sync failure has an uncertain outcome; the next operation reloads it.
+func (s *Store) publish(file *os.File, destination manifest, generation uint64) (commitRoot, error) {
+	if generation == 0 {
+		return commitRoot{}, fmt.Errorf("commit generation exhausted")
+	}
 	h, encoded, err := marshalManifest(destination, s.key, s.chunkSize)
 	if err != nil {
+		return commitRoot{}, err
+	}
+	if len(encoded) > maxManifestSize {
+		return commitRoot{}, fmt.Errorf("manifest exceeds maximum size")
+	}
+	offset, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return commitRoot{}, err
+	}
+	if err := validateManifest(destination, offset, s.chunkSize); err != nil {
+		return commitRoot{}, err
+	}
+	if _, err := file.Write(encoded); err != nil {
+		return commitRoot{}, err
+	}
+	if err := file.Sync(); err != nil {
+		return commitRoot{}, err
+	}
+	root := commitRoot{header: h, generation: generation, offset: offset, digest: sha256.Sum256(encoded)}
+	slot := int64(1 + (generation-1)%2)
+	if _, err := file.WriteAt(encodeRoot(root), slot*rootSpacing); err != nil {
+		return commitRoot{}, err
+	}
+	if err := file.Sync(); err != nil {
+		return commitRoot{}, err
+	}
+	return root, nil
+}
+
+// Compact reclaims obsolete ciphertext and metadata by atomically replacing the
+// blob. Existing readers retain their snapshots.
+func (s *Store) Compact(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := s.lockLatest(); err != nil {
+		return err
+	}
+	defer s.unlockLatest()
+	return s.rewrite(ctx)
+}
 
-	directory := filepath.Dir(s.path)
-	temporary, err := os.CreateTemp(directory, ".sandboxed-*")
+func (s *Store) rewrite(ctx context.Context) error {
+	destination := cloneManifest(s.manifest)
+	temporary, err := os.CreateTemp(filepath.Dir(s.path), ".sandboxed-*")
 	if err != nil {
 		return err
 	}
-
-	temporaryName := temporary.Name()
-	committed := false
-	defer func() {
-		temporary.Close()
-		if !committed {
-			os.Remove(temporaryName)
-		}
-	}()
-
+	defer func() { temporary.Close(); os.Remove(temporary.Name()) }()
 	if err := temporary.Chmod(s.fileMode); err != nil {
 		return err
 	}
-	if _, err := temporary.Write(encodeHeader(h)); err != nil {
+	flags := uint16(0)
+	if len(s.key) != 0 {
+		flags = flagManifestAES
+	}
+	if _, err := temporary.Write(encodeHeader(header{Flags: flags, ChunkSize: uint32(s.chunkSize)})); err != nil {
 		return err
 	}
-	if _, err := temporary.Write(encoded); err != nil {
+	if _, err := temporary.Seek(dataStart, io.SeekStart); err != nil {
 		return err
 	}
-
-	// Open the prior blob as the source for unchanged ciphertext chunks.
 	old, oldErr := os.Open(s.path)
 	if oldErr == nil {
 		defer old.Close()
 	}
 
-	var oldDataOffset int64
-	if oldErr == nil {
-		buffer := make([]byte, headerSize)
-		if _, err := io.ReadFull(old, buffer); err != nil {
-			return err
-		}
-
-		oldHeader, err := decodeHeader(buffer)
-		if err != nil {
-			return err
-		}
-		oldDataOffset = headerSize + int64(oldHeader.ManifestLen)
+	// Copy live ciphertext without decrypting it, preserving reader snapshots.
+	names := make([]string, 0, len(destination.Entries))
+	for name := range destination.Entries {
+		names = append(names, name)
 	}
-
-	// Stream ciphertext from either the old blob or the pending replacement.
+	sort.Strings(names)
 	for _, name := range names {
-		destinationItem := destination.Entries[name]
-		sourceItem := sourceEntries[name]
-
-		for index, part := range destinationItem.Chunks {
-			var source io.Reader
-			if replacement != nil && replacement.name == name {
-				sourcePart := sourceItem.Chunks[index]
-				source = io.NewSectionReader(replacement.file, sourcePart.Offset, int64(part.Size+16))
-			} else {
-				if oldErr != nil {
-					return fmt.Errorf("missing source data for %q", name)
-				}
-
-				sourcePart := sourceItem.Chunks[index]
-				source = io.NewSectionReader(old, oldDataOffset+sourcePart.Offset, int64(part.Size+16))
+		item := destination.Entries[name]
+		for index, part := range item.Chunks {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-
-			if _, err := io.CopyN(temporary, source, int64(part.Size+16)); err != nil {
+			if old == nil {
+				return fmt.Errorf("missing source data for %q: %w", name, oldErr)
+			}
+			offset, err := temporary.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return err
+			}
+			if _, err := io.CopyN(temporary, io.NewSectionReader(old, part.Offset, int64(part.Size+16)), int64(part.Size+16)); err != nil {
 				return fmt.Errorf("copy chunk for %q: %w", name, err)
 			}
+			item.Chunks[index].Offset = offset
 		}
+		destination.Entries[name] = item
 	}
-
-	// Sync and atomically publish the completed replacement.
-	if err := temporary.Sync(); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	root, err := s.publish(temporary, destination, 1)
+	if err != nil {
 		return err
 	}
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(temporaryName, s.path); err != nil {
+	if err := os.Rename(temporary.Name(), s.path); err != nil {
 		return err
 	}
-
-	// Publish in-memory state and make the directory rename durable where possible.
-	s.manifest = destination
-	if directoryFile, err := os.Open(directory); err == nil {
-		directoryFile.Sync()
-		directoryFile.Close()
+	s.manifest, s.generation, s.committedEnd = destination, 1, root.offset+int64(root.header.ManifestLen)
+	directory, err := os.Open(filepath.Dir(s.path))
+	if err != nil {
+		return err
 	}
-	committed = true
-
-	return nil
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func randomKey() ([]byte, error) {

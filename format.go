@@ -34,6 +34,7 @@ type manifest struct {
 }
 
 type entry struct {
+	Revision  []byte  `json:"revision,omitempty"`
 	Directory bool    `json:"directory,omitempty"`
 	Size      int64   `json:"size,omitempty"`
 	Key       []byte  `json:"key,omitempty"`
@@ -41,8 +42,9 @@ type entry struct {
 }
 
 type chunk struct {
-	Offset int64 `json:"offset"`
-	Size   int   `json:"size"`
+	ID     []byte `json:"id,omitempty"`
+	Offset int64  `json:"offset"`
+	Size   int    `json:"size"`
 }
 
 func encodeHeader(value header) []byte {
@@ -71,7 +73,8 @@ func decodeHeader(buffer []byte) (header, error) {
 	if buffer[11] != 0 || buffer[12] != 0 || buffer[13] != 0 {
 		return header{}, fmt.Errorf("unsupported reserved identifier bits")
 	}
-	if binary.BigEndian.Uint16(buffer[14:16]) != formatVersion {
+	version := binary.BigEndian.Uint16(buffer[14:16])
+	if version != formatVersion {
 		return header{}, fmt.Errorf("unsupported store version %d", binary.BigEndian.Uint16(buffer[14:16]))
 	}
 	value := header{
@@ -167,4 +170,72 @@ func chunkAdditionalData(position uint64, size int) []byte {
 	binary.BigEndian.PutUint64(buffer[:8], position)
 	binary.BigEndian.PutUint64(buffer[8:], uint64(size))
 	return buffer[:]
+}
+
+// chunkKey gives each newly encrypted chunk an independent key context.
+func chunkKey(key, id []byte) []byte {
+	hash := hmac.New(sha256.New, key)
+	hash.Write(id)
+	return hash.Sum(nil)
+}
+
+// Separate commit slots keep a torn overwrite away from the preceding root.
+const (
+	rootSize    = 144
+	rootSpacing = 4096
+	dataStart   = 3 * rootSpacing
+)
+
+type commitRoot struct {
+	header     header
+	generation uint64
+	offset     int64
+	digest     [32]byte
+}
+
+func encodeRoot(root commitRoot) []byte {
+	buffer := make([]byte, rootSize)
+	copy(buffer, encodeHeader(root.header))
+	binary.BigEndian.PutUint64(buffer[64:72], root.generation)
+	binary.BigEndian.PutUint64(buffer[72:80], uint64(root.offset))
+	copy(buffer[80:112], root.digest[:])
+	sum := sha256.Sum256(buffer[:112])
+	copy(buffer[112:], sum[:])
+	return buffer
+}
+
+func decodeRoot(buffer []byte) (commitRoot, error) {
+	if len(buffer) != rootSize {
+		return commitRoot{}, fmt.Errorf("invalid commit size")
+	}
+	sum := sha256.Sum256(buffer[:112])
+	if string(sum[:]) != string(buffer[112:]) {
+		return commitRoot{}, fmt.Errorf("incomplete commit record")
+	}
+	h, err := decodeHeader(buffer[:headerSize])
+	if err != nil {
+		return commitRoot{}, err
+	}
+	root := commitRoot{header: h, generation: binary.BigEndian.Uint64(buffer[64:72]), offset: int64(binary.BigEndian.Uint64(buffer[72:80]))}
+	copy(root.digest[:], buffer[80:112])
+	if root.generation == 0 {
+		return commitRoot{}, fmt.Errorf("invalid commit generation")
+	}
+	return root, nil
+}
+
+// sealChunk creates a fresh encryption context even when a write is later
+// aborted or the same chunk is edited repeatedly.
+func sealChunk(fileKey []byte, index uint64, plain []byte) (chunk, []byte, error) {
+	id, err := randomKey()
+	if err != nil {
+		return chunk{}, nil, err
+	}
+	key := chunkKey(fileKey, id)
+	aead, err := fileAEAD(key)
+	if err != nil {
+		return chunk{}, nil, err
+	}
+	ciphertext := aead.Seal(nil, chunkNonce(key, index), plain, chunkAdditionalData(index, len(plain)))
+	return chunk{ID: id, Size: len(plain)}, ciphertext, nil
 }
