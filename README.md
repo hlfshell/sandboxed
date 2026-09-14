@@ -4,73 +4,41 @@
   <img src="imgs/sandboxed.png" width="420">
 </p>
 
-`sandboxed` is a Go module that presents sandboxed file storage for untrusted binary data as an `io/fs`. All data is stored in a single opaque file; all original payload bytes are chunked and encrypted before being written to disk. Virtual paths are never joined to host paths. Stored content is never executed and does not expose executable mode bits, symlinks, device files, or host filesystem handles.
-
-Implementing applications must preserve that boundary when copying data elsewhere.
-
-## Safety Warning
-
-The purpose of this library is to provide some level of sandbox isolation, but is no way a guarentee of safety. Consider your applications **carefully**.
-
-
-## Platform support
-
-`sandboxed` currently supports Linux, macOS, and other POSIX-style systems. Its virtual paths always use platform-independent `io/fs` naming conventions.
-
-Native Windows storage is not currently supported. Windows file-sharing and replacement semantics differ when the backing blob has open readers, so compaction may return a sharing or rename error. Commit durability and crash recovery have not been verified on Windows. Use WSL when running on a Windows host.
-
-## Usage
+`sandboxed` is a Go filesystem for storing untrusted data as encrypted chunks. Each store owns a private directory containing a manifest and randomly named chunk files. Only paths recorded in the manifest exist in the virtual filesystem; callers cannot use it to access the manifest, lock, chunk files, or other host files.
 
 ```go
-store, err := sandboxed.OpenStore("store.sandboxed",
-	sandboxed.WithChunkSize(1024 * 1024), // Encrypt files in 1 MiB chunks
-	sandboxed.WithFileMode(0640),         // Optional; defaults to 0600
-)
+store, err := sandboxed.OpenStore("uploads", sandboxed.WithChunkSize(1024*1024))
 if err != nil {
-	return err
+    return err
+}
+defer store.Close()
+
+if err := store.WriteFile("photo.jpg", upload); err != nil {
+    return err
 }
 
-if err := store.MkdirAll("incoming/images"); err != nil {
-	return err
-}
-if err := store.WriteFile("incoming/images/photo.jpg", upload); err != nil {
-	return err
-}
-
-file, err := store.Open("incoming/images/photo.jpg")
+file, err := store.Open("photo.jpg")
 if err != nil {
-	return err
+    return err
 }
 defer file.Close()
 
 _, err = io.Copy(destination, file)
 ```
 
-`Store` implements `fs.FS`, `fs.ReadFileFS`, `fs.ReadDirFS`, and `fs.StatFS`.
+## Reading and writing
 
-## Manifest encryption
-
-Without a store key, paths and file metadata remain readable in the blob while payloads remain encrypted. Pass a 32-byte key to encrypt the manifest too:
-
-```go
-store, err := sandboxed.OpenStore("private.dat",
-	sandboxed.WithEncryption(key),
-)
-```
-
-## Reading and writing files
-
-Choose the operation by what you want to do:
+All files exist within a virtual file system - you can only reference or affect files within the store's virtual file system.
 
 - `Open(name)` reads an existing file or directory.
 - `Create(name)` creates or replaces a file.
-- `Update(name)` opens an existing file for changes without clearing it.
-- `WriteFile(name, reader)` streams a complete replacement from a reader.
+- `Update(name)` modifies an existing file without clearing it.
+- `WriteFile(name, reader)` streams a complete replacement.
 
 `Create` and `Update` return the same file handle, supporting `Read`, `Write`, `Seek`, `ReadAt`, `WriteAt`, and `Truncate`. Chunk encryption is automatic. To append, seek to the end before writing.
 
 ```go
-file, err := store.Update("incoming/images/photo.jpg")
+file, err := store.Update("photo.jpg")
 if err != nil {
     return err
 }
@@ -85,25 +53,47 @@ if _, err := file.Write(patch); err != nil {
 return file.Close()
 ```
 
-Changes become visible when `Close` succeeds; always check its error. `Abort` discards changes and is safe to defer. Reads on the same writable handle see its changes, while other readers retain their snapshots. All writes use the same conflict rule: if another writer changes the same file before you commit, the commit returns `ErrConflict`. Reopen the file to retry.
+Changes become visible when `Close` commits them; always check its error. `Abort` discards changes and is safe to defer. Reads on the same writable handle see its staged changes. If another writer changes that file before it commits, `Close` returns `ErrConflict`; reopen the file to retry. `WriteFile` follows the same rule.
 
-Updating a file writes only the affected chunks and a new manifest. Replacing a file writes its new contents and a new manifest. Neither operation copies unrelated files. The existing `io/fs` interfaces remain supported, and the writable handle works with standard helpers such as `io.Copy`.
+`Store` implements `fs.FS`, `fs.ReadFileFS`, `fs.ReadDirFS`, and `fs.StatFS`. Standard helpers such as `io.Copy`, `io.ReadAll`, and `fs.WalkDir` work normally. Virtual permissions are fixed and non-executable, and host filesystem handles are never exposed.
 
-## Storage behavior
+## Chunk storage and cleanup
 
-- Each file receives an independent random 256-bit AES key.
-- Every blob begins with a 16-byte structured identifier: the 9-byte `SANDBOXED` signature, a 2-byte configuration bitfield, 3 reserved bytes, and a 2-byte format version. Encrypted manifests authenticate this complete identifier as associated data.
-- Payloads are split into configurable 4 KB - 64 MB chunks.
-- Each new chunk encryption receives a random 256-bit identity. HMAC-SHA256 derives its AES-256-GCM key from the file key and that identity; its chunk position and plaintext size are authenticated. Repeated edits use fresh identities, including edits that are aborted.
-- Mutations append changed ciphertext and a complete manifest to the same blob. Unchanged ciphertext stays at its existing offsets. Metadata-only operations append a manifest without copying payloads.
-- Payloads and metadata are synced before publishing one of two alternating, checksummed commit records, stored in separate 4 KiB regions. The commit record is then synced. Recovery selects the newest complete record and ignores an uncommitted tail. A damaged committed manifest fails to open.
-- As with other durable file operations, a final sync error can leave the commit outcome uncertain. Reopen the virtual file to inspect its current state.
-- A stable `*.lock` coordination file serializes metadata operations across goroutines, independently opened `Store` values, and cooperating processes. Locks are released after an immutable read snapshot is opened and after each mutation commits; an open content stream does not retain the lock.
-- Reads decrypt at most one configured chunk at a time. Writes use a bounded number of chunk buffers and stage only ciphertext. Metadata memory scales with the number of entries and chunks; encoded manifests are limited to 64 MiB.
-- The backing blob and temporary replacement default to mode `0600`. Use `WithFileMode` when the deployment needs different permission bits.
+A 5 MB file with 1 MB chunks (assuming default settings) creates 5 encrypted chunk files. Changing part of a file that affects only a single chunk encrypts and writes that whole chunk under a fresh random name. Unchanged chunks remain untouched. A commit syncs its new chunks, then atomically replaces the private manifest. It never copies unrelated payloads, though it still writes a full manifest.
 
-## Chunk updates and compaction
+Open readers hold in-memory references to their snapshot's chunks. Writers also retain their source snapshot and keep encrypted staging files private until commit. Replacing or removing a file cannot invalidate those handles. A chunk is deleted only when neither the current manifest nor any open handle references it. Shared chunks survive until every reference is released.
 
-Changing even part of a chunk produces new ciphertext for that chunk, so the whole affected chunk must be encrypted and written again. Unchanged chunks stay where they are; updating a file does not rewrite the entire file or store. Each commit also writes the full manifest describing where the current chunks live.
+Cleanup runs on commits and handle closes, without a background daemon. `store.Cleanup(ctx)` retries any outstanding chunk deletions. At startup, the store validates its manifest and live chunks before removing orphan chunks and abandoned temporary files. There is no whole-store compaction step.
 
-New chunks are appended so existing readers can finish reading the old copies. Call `store.Compact(ctx)` when you want to reclaim space: it copies the live chunks into a replacement store and removes the unused copies. Compaction needs temporary space for that replacement and blocks other commits while it runs; existing readers can continue.
+Close or abort every file handle. `Store.Close()` returns `ErrBusy` while handles remain open; release them and retry. Closing an already closed store is safe. Cleanup and final sync errors are returned to the caller; a commit error after manifest replacement may mean the change was published, so inspect the current file before retrying.
+
+## Store ownership
+
+One `Store` instance in one process owns a directory. Share it between goroutines. A second opener receives `ErrBusy` until the owner closes. Cross-process access is not supported; in-memory references are intentionally not shared between processes.
+
+Ownership uses an OS-managed advisory lock held for the store's lifetime. The OS releases it automatically when the process exits or crashes, including `SIGKILL`. The `lock` file may remain on disk, but its existence does not indicate ownership. A live but paused process keeps ownership; terminate it before handing the store to another process. Do not delete the lock file or modify internal files while a store is owned.
+
+## Encryption and isolation
+
+Payloads and staging files contain ciphertext only. Each file has a random 256-bit key, and each newly encrypted chunk has a random 256-bit identity. HMAC-SHA256 derives a separate AES-256-GCM key for that chunk; its position and plaintext size are authenticated. The chunk identity also supplies its opaque filename, without revealing a hash of the plaintext.
+
+Without a store key, the manifest contains readable virtual paths, metadata, and file keys. Pass a 32-byte key to hide them too:
+
+```go
+store, err := sandboxed.OpenStore("private", sandboxed.WithEncryption(key))
+```
+
+The private directory layout looks like this:
+
+```text
+uploads/
+  manifest
+  lock
+  chunks/
+    <random 64-character hex ID>
+    <random 64-character hex ID>
+```
+
+Internal file access is relative to pinned directory descriptors and rejects symlinks and nonregular chunk files. Virtual paths are never used as host paths. The manifest has a bounded length and checksum; encrypted manifests are also authenticated. The host can still observe chunk counts and sizes. This is not protection against an administrator controlling the process or rolling the store back, and applications must preserve the boundary when exporting plaintext.
+
+Directories default to mode `0700`; manifests, chunks, and temporary files default to `0600`. `WithFileMode` changes permissions on data files, while the directories and ownership lock remain private. `WithChunkSize` configures new stores from 4 KB to 64 MB. Reads and writes use bounded chunk buffers; metadata memory scales with entries and chunks. Encoded manifests are limited to 64 MB. Seeking or truncating beyond EOF fills extensions with encrypted zeros, so their disk cost scales with their length.

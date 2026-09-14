@@ -34,7 +34,7 @@ func TestHeaderUsesStructuredIdentifier(t *testing.T) {
 }
 
 func TestStoreImplementsExpectedInterfaces(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "data.sandboxed"))
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "data.sandboxed"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestStoreImplementsExpectedInterfaces(t *testing.T) {
 
 func TestStoreRoundTripAcrossChunks(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "data.sandboxed")
-	store, err := OpenStore(filename, WithChunkSize(minimumChunkSize))
+	store, err := openTestStore(t, filename, WithChunkSize(minimumChunkSize))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,10 @@ func TestStoreRoundTripAcrossChunks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := OpenStore(filename)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := openTestStore(t, filename)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +139,7 @@ func TestStoreRoundTripAcrossChunks(t *testing.T) {
 }
 
 func TestStoreImplementsStandardFilesystemHelpers(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "data.sandboxed"))
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "data.sandboxed"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +178,7 @@ func TestStoreImplementsStandardFilesystemHelpers(t *testing.T) {
 
 func TestVirtualPathsCannotEscapeStore(t *testing.T) {
 	directory := t.TempDir()
-	store, err := OpenStore(filepath.Join(directory, "data.sandboxed"))
+	store, err := openTestStore(t, filepath.Join(directory, "data.sandboxed"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +206,7 @@ func TestVirtualPathsCannotEscapeStore(t *testing.T) {
 
 func TestPayloadIsNeverStoredAsPlaintext(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "data.sandboxed")
-	store, err := OpenStore(filename, WithChunkSize(minimumChunkSize))
+	store, err := openTestStore(t, filename, WithChunkSize(minimumChunkSize))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,13 +214,19 @@ func TestPayloadIsNeverStoredAsPlaintext(t *testing.T) {
 	if err := store.WriteFile("recognizable-name.txt", bytes.NewReader(secret)); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(filename)
+	raw, err := os.ReadFile(filepath.Join(filename, "manifest"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(raw, secret) || bytes.Contains(raw, []byte("plaintext-must-not-appear-plaintext")) {
-		t.Fatal("backing blob contains recognizable plaintext payload")
+		t.Fatal("manifest contains recognizable plaintext payload")
 	}
+	for _, ciphertext := range chunkFiles(t, store) {
+		if bytes.Contains(ciphertext, []byte("plaintext-must-not-appear-plaintext")) {
+			t.Fatal("chunk contains plaintext payload")
+		}
+	}
+
 	if !bytes.Contains(raw, []byte("recognizable-name.txt")) {
 		t.Fatal("unencrypted manifest should keep pathing readable")
 	}
@@ -226,28 +235,31 @@ func TestPayloadIsNeverStoredAsPlaintext(t *testing.T) {
 func TestEncryptedManifestHidesPathsAndRejectsWrongKeys(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "data.sandboxed")
 	key := bytes.Repeat([]byte{0x42}, 32)
-	store, err := OpenStore(filename, WithEncryption(key))
+	store, err := openTestStore(t, filename, WithEncryption(key))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := store.WriteFile("private-name.txt", strings.NewReader("private body")); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(filename)
+	raw, err := os.ReadFile(filepath.Join(filename, "manifest"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(raw, []byte("private-name.txt")) || bytes.Contains(raw, []byte("private body")) {
 		t.Fatal("encrypted store exposed manifest or payload plaintext")
 	}
-	if _, err := OpenStore(filename); err == nil {
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openTestStore(t, filename); err == nil {
 		t.Fatal("opening encrypted store without key succeeded")
 	}
 	wrong := bytes.Repeat([]byte{0x24}, 32)
-	if _, err := OpenStore(filename, WithEncryption(wrong)); err == nil {
+	if _, err := openTestStore(t, filename, WithEncryption(wrong)); err == nil {
 		t.Fatal("opening encrypted store with wrong key succeeded")
 	}
-	reopened, err := OpenStore(filename, WithEncryption(key))
+	reopened, err := openTestStore(t, filename, WithEncryption(key))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,22 +271,30 @@ func TestEncryptedManifestHidesPathsAndRejectsWrongKeys(t *testing.T) {
 
 func TestTamperedChunkFailsAuthentication(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "data.sandboxed")
-	store, err := OpenStore(filename)
+	store, err := openTestStore(t, filename)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := store.WriteFile("file", strings.NewReader("authenticated data")); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(filename)
+	raw, err := os.ReadFile(filepath.Join(filename, "manifest"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw[store.manifest.Entries["file"].Chunks[0].Offset] ^= 0xff
-	if err := os.WriteFile(filename, raw, 0600); err != nil {
+	part := store.manifest.Entries["file"].Chunks[0]
+	raw, err = os.ReadFile(chunkPath(store, part))
+	if err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenStore(filename)
+	raw[0] ^= 0xff
+	if err := os.WriteFile(chunkPath(store, part), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := openTestStore(t, filename)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +304,7 @@ func TestTamperedChunkFailsAuthentication(t *testing.T) {
 }
 
 func TestWriteReplacementAndRemovePreserveOtherFiles(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "data.sandboxed"), WithChunkSize(minimumChunkSize))
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "data.sandboxed"), WithChunkSize(minimumChunkSize))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +335,7 @@ func TestWriteReplacementAndRemovePreserveOtherFiles(t *testing.T) {
 }
 
 func TestDirectoriesMustBeEmptyBeforeRemoval(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "data.sandboxed"))
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "data.sandboxed"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +357,7 @@ func TestDirectoriesMustBeEmptyBeforeRemoval(t *testing.T) {
 }
 
 func TestEmptyFile(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "data.sandboxed"))
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "data.sandboxed"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +374,7 @@ func TestEmptyFile(t *testing.T) {
 }
 
 func TestFailedStreamDoesNotPublishPartialFile(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "data.sandboxed"))
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "data.sandboxed"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +400,7 @@ type errorReader struct{ err error }
 func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
 
 func TestOpenReaderKeepsAtomicSnapshot(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "data.sandboxed"), WithChunkSize(minimumChunkSize))
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "data.sandboxed"), WithChunkSize(minimumChunkSize))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,16 +427,13 @@ func TestOpenReaderKeepsAtomicSnapshot(t *testing.T) {
 
 func TestReadersKeepSnapshotsAcrossReplacementAndRemoval(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "data.sandboxed")
-	readerStore, err := OpenStore(filename, WithChunkSize(minimumChunkSize))
+	readerStore, err := openTestStore(t, filename, WithChunkSize(minimumChunkSize))
 	if err != nil {
 		t.Fatal(err)
 	}
-	writerStore, err := OpenStore(filename)
-	if err != nil {
-		t.Fatal(err)
-	}
+	writerStore := readerStore
 
-	// Open the original generation before another Store replaces it.
+	// Open the original version before replacing it through the shared Store.
 	original := bytes.Repeat([]byte("original-"), 1000)
 	if err := writerStore.WriteFile("foo", bytes.NewReader(original)); err != nil {
 		t.Fatal(err)
@@ -469,7 +486,7 @@ func TestReadersKeepSnapshotsAcrossReplacementAndRemoval(t *testing.T) {
 }
 
 func TestDirectoryFileSupportsReadDir(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "data.sandboxed"))
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "data.sandboxed"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,13 +525,13 @@ func TestDirectoryFileSupportsReadDir(t *testing.T) {
 }
 
 func TestConfigurationAndMalformedStores(t *testing.T) {
-	if _, err := OpenStore(filepath.Join(t.TempDir(), "small"), WithChunkSize(1)); err == nil {
+	if _, err := openTestStore(t, filepath.Join(t.TempDir(), "small"), WithChunkSize(1)); err == nil {
 		t.Fatal("accepted undersized chunks")
 	}
-	if _, err := OpenStore(filepath.Join(t.TempDir(), "key"), WithEncryption([]byte("short"))); err == nil {
+	if _, err := openTestStore(t, filepath.Join(t.TempDir(), "key"), WithEncryption([]byte("short"))); err == nil {
 		t.Fatal("accepted short key")
 	}
-	if _, err := OpenStore(filepath.Join(t.TempDir(), "mode"), WithFileMode(fs.ModeDir|0700)); err == nil {
+	if _, err := openTestStore(t, filepath.Join(t.TempDir(), "mode"), WithFileMode(fs.ModeDir|0700)); err == nil {
 		t.Fatal("accepted non-permission file mode bits")
 	}
 	directory := t.TempDir()
@@ -522,34 +539,38 @@ func TestConfigurationAndMalformedStores(t *testing.T) {
 	if err := os.WriteFile(filename, []byte("not a store"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenStore(filename); err == nil {
+	if _, err := openTestStore(t, filename); err == nil {
 		t.Fatal("opened truncated malformed store")
 	}
 
 	valid := filepath.Join(directory, "valid.sandboxed")
-	if _, err := OpenStore(valid); err != nil {
+	validStore, err := openTestStore(t, valid)
+	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(valid)
+	if err := validStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(valid, "manifest"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	raw[0] ^= 0xff
-	if err := os.WriteFile(valid, raw, 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(valid, "manifest"), raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenStore(valid); err == nil {
+	if _, err := openTestStore(t, valid); err == nil {
 		t.Fatal("opened store with invalid magic")
 	}
 }
 
 func TestBackingFileModeIsConfigurable(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "data.sandboxed")
-	store, err := OpenStore(filename, WithFileMode(0640))
+	store, err := openTestStore(t, filename, WithFileMode(0640))
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(filename)
+	info, err := os.Stat(filepath.Join(filename, "manifest"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,7 +580,7 @@ func TestBackingFileModeIsConfigurable(t *testing.T) {
 	if err := store.WriteFile("file", strings.NewReader("data")); err != nil {
 		t.Fatal(err)
 	}
-	info, err = os.Stat(filename)
+	info, err = os.Stat(filepath.Join(filename, "manifest"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,16 +589,13 @@ func TestBackingFileModeIsConfigurable(t *testing.T) {
 	}
 }
 
-func TestIndependentStoresSerializeConcurrentMutations(t *testing.T) {
+func TestStoreSerializesConcurrentMutations(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "data.sandboxed")
-	first, err := OpenStore(filename)
+	first, err := openTestStore(t, filename)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := OpenStore(filename)
-	if err != nil {
-		t.Fatal(err)
-	}
+	second := first
 
 	start := make(chan struct{})
 	errors := make(chan error, 2)
@@ -596,7 +614,7 @@ func TestIndependentStoresSerializeConcurrentMutations(t *testing.T) {
 		}
 	}
 
-	// Both long-lived handles must refresh stale manifests before reads.
+	// Both goroutines publish into the shared manifest without losing updates.
 	for _, store := range []*Store{first, second} {
 		for name, expected := range map[string]string{
 			"first":  "written by first store",
@@ -612,21 +630,24 @@ func TestIndependentStoresSerializeConcurrentMutations(t *testing.T) {
 		}
 	}
 
-	if _, err := os.Stat(filename + ".lock"); err != nil {
+	if _, err := os.Stat(filepath.Join(filename, "lock")); err != nil {
 		t.Fatalf("coordination lock file: %v", err)
 	}
 }
 
 func TestStoreRejectsUnsupportedFormatVersions(t *testing.T) {
 	store := testStore(t)
-	original := blob(t, store)
+	original := manifestBytes(t, store)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
 	for _, version := range []uint16{0, 2, 65535} {
 		raw := append([]byte(nil), original...)
 		binary.BigEndian.PutUint16(raw[14:16], version)
-		if err := os.WriteFile(store.path, raw, 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(store.path, "manifest"), raw, 0600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := OpenStore(store.path); err == nil {
+		if _, err := openTestStore(t, store.path); err == nil {
 			t.Fatalf("accepted format version %d", version)
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"io"
 	"io/fs"
 	"os"
@@ -81,28 +82,25 @@ func (s *Store) openWritable(name string, replace bool) (*File, error) {
 
 	// Capture the source while its generation is stable. New files retain an empty
 	// base so concurrent creation can be detected at commit time.
-	source, err := os.Open(s.path)
-	if err != nil {
-		return nil, err
-	}
+	var err error
 	item := base
 	if replace {
 		item.Key, err = randomKey()
 		if err != nil {
-			source.Close()
 			return nil, err
 		}
 		item.Size, item.Chunks = 0, nil
 	} else {
 		item.Chunks = append([]chunk(nil), base.Chunks...)
 	}
-	result := &File{store: s, source: &openFile{name: name, entry: base, file: source}, item: item, existed: exists, changed: replace, dirty: make(map[int]chunk)}
-	result.file, err = os.CreateTemp("", "sandboxed-file-*")
+	result := &File{store: s, source: &openFile{store: s, name: name, entry: base}, item: item, existed: exists, changed: replace, dirty: make(map[int]chunk)}
+	result.file, err = s.temporary(".staging-")
 	if err != nil {
-		source.Close()
 		return nil, err
 	}
 
+	s.handles++
+	s.retain(base)
 	return result, nil
 }
 
@@ -230,15 +228,15 @@ func (f *File) readAt(p []byte, offset int64) (int, error) {
 }
 
 func (f *File) loadChunk(index int) ([]byte, error) {
-	source := f.source.file
-	if _, ok := f.dirty[index]; ok {
-		source = f.file
+	part := f.item.Chunks[index]
+	if _, dirty := f.dirty[index]; !dirty {
+		return f.store.readChunk(f.item.Key, index, part)
 	}
-	snapshot := openFile{file: source, entry: f.item}
-	if err := snapshot.loadChunk(index, int64(index)*int64(f.store.chunkSize)); err != nil {
+	ciphertext := make([]byte, part.Size+16)
+	if _, err := f.file.ReadAt(ciphertext, part.Offset); err != nil {
 		return nil, err
 	}
-	return snapshot.plain, nil
+	return decryptChunk(f.item.Key, index, part, ciphertext)
 }
 
 // Seek sets the position used by Read and Write. Seeking beyond EOF does not
@@ -394,27 +392,35 @@ func (f *File) Close() (err error) {
 		return ErrConflict
 	}
 
-	// Compaction may have moved unchanged chunks since this handle opened.
-	for index := range f.item.Chunks {
-		if _, changed := f.dirty[index]; !changed {
-			f.item.Chunks[index] = previous.Chunks[index]
+	// Publish each changed chunk under its immutable random name. Cleanup cannot
+	// run concurrently because this commit holds the store mutex.
+	for index, part := range f.dirty {
+		if index >= len(f.item.Chunks) {
+			continue
 		}
+		name := chunkName(part)
+		output, err := openInternal(f.store.chunks, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL, f.store.fileMode)
+		if err != nil {
+			return err
+		}
+		f.store.garbage[name] = struct{}{}
+		_, copyErr := io.CopyN(output, io.NewSectionReader(f.file, part.Offset, int64(part.Size+16)), int64(part.Size+16))
+		err = errors.Join(copyErr, output.Sync(), output.Close())
+		if err != nil {
+			return fmt.Errorf("publish chunk: %w", err)
+		}
+	}
+	if err := f.store.chunks.Sync(); err != nil {
+		return err
 	}
 	revision, err := randomKey()
 	if err != nil {
 		return err
 	}
 	f.item.Revision = revision
-	f.store.manifest.Entries[f.source.name] = f.item
-	if err := f.store.commit(&pendingFile{name: f.source.name, file: f.file, chunks: f.dirty}); err != nil {
-		if exists {
-			f.store.manifest.Entries[f.source.name] = previous
-		} else {
-			delete(f.store.manifest.Entries, f.source.name)
-		}
-		return err
-	}
-	return nil
+	next := cloneManifest(f.store.manifest)
+	next.Entries[f.source.name] = f.item
+	return f.store.commit(next)
 }
 
 // Abort discards staged updates and releases resources. It is safe to defer,
@@ -430,5 +436,5 @@ func (f *File) Abort() error {
 }
 
 func (f *File) cleanup() error {
-	return errors.Join(f.source.Close(), f.file.Close(), os.Remove(f.file.Name()))
+	return errors.Join(f.file.Close(), removeInternal(f.store.root, f.file.Name()), f.source.Close())
 }

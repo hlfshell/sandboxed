@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -37,7 +38,7 @@ func TestPartialWritesPublishOnlyChangedChunks(t *testing.T) {
 	store := testStore(t, WithEncryption(bytes.Repeat([]byte{5}, 32)))
 	original := bytes.Repeat([]byte("a"), minimumChunkSize*4)
 	putFile(t, store, "file", original)
-	before := blob(t, store)
+	before := chunkFiles(t, store)
 	oldChunks := append([]chunk(nil), store.manifest.Entries["file"].Chunks...)
 	reader, err := store.Open("file")
 	if err != nil {
@@ -58,7 +59,7 @@ func TestPartialWritesPublishOnlyChangedChunks(t *testing.T) {
 		t.Fatal("reused chunk encryption context")
 	}
 	assertFile(t, store, "file", original)
-	staging, err := os.ReadFile(handle.file.Name())
+	staging, err := os.ReadFile(filepath.Join(store.path, handle.file.Name()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,29 +73,22 @@ func TestPartialWritesPublishOnlyChangedChunks(t *testing.T) {
 	copy(expected[minimumChunkSize-3:], patch)
 	copy(expected[1:], "again")
 	assertFile(t, store, "file", expected)
-	after := blob(t, store)
-	if !bytes.Equal(before[dataStart:], after[dataStart:len(before)]) {
-		t.Fatal("partial write changed prior records")
+	after := chunkFiles(t, store)
+	// The old reader pins two replaced chunks; only two new chunks are published.
+	if len(after) != len(before)+2 {
+		t.Fatalf("chunk count=%d want=%d", len(after), len(before)+2)
 	}
 	for index := 2; index < 4; index++ {
 		part := store.manifest.Entries["file"].Chunks[index]
-		if part.Offset != oldChunks[index].Offset || !bytes.Equal(part.ID, oldChunks[index].ID) {
+		if !bytes.Equal(part.ID, oldChunks[index].ID) || !bytes.Equal(after[chunkName(part)], before[chunkName(part)]) {
 			t.Fatal("unchanged chunk was rewritten")
 		}
-	}
-	// Multiple edits of one chunk publish just its latest version.
-	_, encoded, err := marshalManifest(store.manifest, store.key, store.chunkSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if growth, want := len(after)-len(before), 2*(minimumChunkSize+16)+len(encoded); growth != want {
-		t.Fatalf("growth=%d want=%d", growth, want)
 	}
 	snapshot, err := io.ReadAll(reader)
 	if err != nil || !bytes.Equal(snapshot, original) {
 		t.Fatalf("snapshot changed: %v", err)
 	}
-	if _, err := os.Stat(handle.file.Name()); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(store.path, handle.file.Name())); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("staging survived close: %v", err)
 	}
 	if err := handle.Close(); !errors.Is(err, fs.ErrClosed) {
@@ -125,17 +119,14 @@ func TestPartialWriterExtendsWithoutHoles(t *testing.T) {
 }
 
 func TestPartialWriterConflictsAndUnrelatedCommits(t *testing.T) {
-	for _, operation := range []string{"edit", "replace", "remove", "recreate", "unrelated", "compact"} {
+	for _, operation := range []string{"edit", "replace", "remove", "recreate", "unrelated", "cleanup"} {
 		t.Run(operation, func(t *testing.T) {
 			store := testStore(t)
 			original := bytes.Repeat([]byte("a"), minimumChunkSize*2)
 			putFile(t, store, "file", original)
 			handle := openWritable(t, store, "file")
 			writeAt(t, handle, []byte("ours"), 1)
-			other, err := OpenStore(store.path)
-			if err != nil {
-				t.Fatal(err)
-			}
+			other := store
 			switch operation {
 			case "edit":
 				concurrent := openWritable(t, other, "file")
@@ -154,13 +145,13 @@ func TestPartialWriterConflictsAndUnrelatedCommits(t *testing.T) {
 				}
 			case "unrelated":
 				putFile(t, other, "another", []byte("another"))
-			case "compact":
-				if err := other.Compact(context.Background()); err != nil {
+			case "cleanup":
+				if err := other.Cleanup(context.Background()); err != nil {
 					t.Fatal(err)
 				}
 			}
-			err = handle.Close()
-			if operation == "unrelated" || operation == "compact" {
+			err := handle.Close()
+			if operation == "unrelated" || operation == "cleanup" {
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -186,7 +177,7 @@ func TestPartialWriterConflictsAndUnrelatedCommits(t *testing.T) {
 					}
 				}
 			}
-			if _, err := os.Stat(handle.file.Name()); !errors.Is(err, fs.ErrNotExist) {
+			if _, err := os.Stat(filepath.Join(store.path, handle.file.Name())); !errors.Is(err, fs.ErrNotExist) {
 				t.Fatalf("staging survived: %v", err)
 			}
 		})
@@ -196,7 +187,7 @@ func TestPartialWriterConflictsAndUnrelatedCommits(t *testing.T) {
 func TestFileAbortAndNoOpReleaseResources(t *testing.T) {
 	store := testStore(t)
 	putFile(t, store, "file", []byte("original"))
-	before := blob(t, store)
+	before := manifestBytes(t, store)
 	handle := openWritable(t, store, "file")
 	writeAt(t, handle, []byte("changed"), 0)
 	if err := handle.Abort(); err != nil {
@@ -208,7 +199,7 @@ func TestFileAbortAndNoOpReleaseResources(t *testing.T) {
 	if err := handle.Close(); !errors.Is(err, fs.ErrClosed) {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(handle.file.Name()); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(store.path, handle.file.Name())); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("abort left staging: %v", err)
 	}
 	noop := openWritable(t, store, "file")
@@ -216,7 +207,7 @@ func TestFileAbortAndNoOpReleaseResources(t *testing.T) {
 	if err := noop.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(before, blob(t, store)) {
+	if !bytes.Equal(before, manifestBytes(t, store)) {
 		t.Fatal("abort or no-op modified store")
 	}
 }
@@ -237,11 +228,11 @@ func TestFileAuthenticationFailureDoesNotPublish(t *testing.T) {
 		store := testStore(t)
 		putFile(t, store, "file", []byte("original"))
 		handle := openWritable(t, store, "file")
-		target := store.path
-		offset := handle.item.Chunks[0].Offset
+		target := chunkPath(store, handle.item.Chunks[0])
+		offset := int64(0)
 		if staged {
 			writeAt(t, handle, []byte("changed"), 0)
-			target = handle.file.Name()
+			target = filepath.Join(store.path, handle.file.Name())
 			offset = handle.item.Chunks[0].Offset
 		}
 		file, err := os.OpenFile(target, os.O_RDWR, 0)
@@ -259,14 +250,14 @@ func TestFileAuthenticationFailureDoesNotPublish(t *testing.T) {
 		if err := file.Close(); err != nil {
 			t.Fatal(err)
 		}
-		before := blob(t, store)
+		before := manifestBytes(t, store)
 		if _, err := handle.WriteAt([]byte("patch"), 0); err == nil {
 			t.Fatal("accepted unauthenticated chunk")
 		}
 		if err := handle.Close(); err == nil {
 			t.Fatal("published failed edit")
 		}
-		if !bytes.Equal(before, blob(t, store)) {
+		if !bytes.Equal(before, manifestBytes(t, store)) {
 			t.Fatal("failed edit changed store")
 		}
 		if staged {

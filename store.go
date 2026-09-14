@@ -2,7 +2,6 @@ package sandboxed
 
 import (
 	"bufio"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,22 +12,29 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/gofrs/flock"
+	"golang.org/x/sys/unix"
 )
 
-// Store is a mutable filesystem backed by one binary file. Store implements
+// Store owns a directory of encrypted chunks and a private manifest. Store implements
 // fs.FS, fs.ReadFileFS, fs.ReadDirFS, and fs.StatFS.
 type Store struct {
-	path         string
-	chunkSize    int
-	key          []byte
-	fileMode     fs.FileMode
-	manifest     manifest
-	generation   uint64
-	committedEnd int64
-	lock         sync.RWMutex
-	fileLock     *flock.Flock
+	path      string
+	chunkSize int
+	key       []byte
+	fileMode  fs.FileMode
+	manifest  manifest
+	lock      sync.Mutex
+	root      *os.File
+	chunks    *os.File
+	owner     *os.File
+	refs      map[string]int
+	garbage   map[string]struct{}
+	handles   int
+	closed    bool
 }
+
+// ErrBusy means the store is already owned, or still has open file handles.
+var ErrBusy = errors.New("store is in use")
 
 // Compilation-time check that we are indeed implementing these interfaces
 var (
@@ -38,53 +44,110 @@ var (
 	_ fs.StatFS     = (*Store)(nil)
 )
 
-// OpenStore opens the blob at filename, creating it when it does not exist.
-func OpenStore(filename string, options ...Option) (*Store, error) {
-	// Apply configuration and resolve the backing file.
+// OpenStore opens or creates a private store directory. One Store instance in
+// one process owns it until Close. Startup removes abandoned temporary files and
+// unreferenced chunks only after acquiring exclusive ownership.
+func OpenStore(directory string, options ...Option) (_ *Store, err error) {
 	config := config{chunkSize: defaultChunkSize, fileMode: 0600}
 	for _, option := range options {
 		if err := option(&config); err != nil {
 			return nil, err
 		}
 	}
-	filename, err := filepath.Abs(filename)
+	directory, err = filepath.Abs(directory)
 	if err != nil {
 		return nil, err
 	}
-	store := &Store{
-		path:      filename,
-		chunkSize: config.chunkSize,
-		key:       config.key,
-		fileMode:  config.fileMode,
-		fileLock:  flock.New(filename + ".lock"),
+	created := false
+	if err := os.Mkdir(directory, 0700); err == nil {
+		created = true
+	} else if !errors.Is(err, fs.ErrExist) {
+		return nil, err
 	}
-
-	// Lock creation and loading so simultaneous openers see one complete store.
-	if err := store.fileLock.Lock(); err != nil {
+	root, err := openDirectory(directory)
+	if err != nil {
+		return nil, fmt.Errorf("open store directory: %w", err)
+	}
+	store := &Store{path: directory, chunkSize: config.chunkSize, key: config.key, fileMode: config.fileMode, root: root, refs: make(map[string]int), garbage: make(map[string]struct{})}
+	defer func() {
+		if err != nil {
+			if store.chunks != nil {
+				store.chunks.Close()
+			}
+			if store.owner != nil {
+				store.owner.Close()
+			}
+			root.Close()
+		}
+	}()
+	store.owner, err = openInternal(root, "lock", unix.O_RDWR|unix.O_CREAT, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open store lock: %w", err)
+	}
+	if err := unix.Flock(int(store.owner.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, ErrBusy
+		}
 		return nil, fmt.Errorf("lock store: %w", err)
 	}
-	defer store.fileLock.Unlock()
-
-	// Initialize a new blob or load the existing manifest.
-	_, err = os.Stat(filename)
-	if errors.Is(err, os.ErrNotExist) {
-		store.manifest = manifest{Entries: map[string]entry{".": {Directory: true}}}
-		if err := store.rewrite(context.Background()); err != nil {
+	if err := unix.Mkdirat(int(root.Fd()), "chunks", 0700); err != nil && !errors.Is(err, unix.EEXIST) {
+		return nil, err
+	}
+	fd, err := unix.Openat(int(root.Fd()), "chunks", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open chunks directory: %w", err)
+	}
+	store.chunks = os.NewFile(uintptr(fd), "chunks")
+	if err := store.load(); errors.Is(err, errMissingManifest) {
+		entries, scanErr := readDirectory(store.chunks)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if len(entries) != 0 {
+			return nil, fmt.Errorf("missing manifest with existing chunks")
+		}
+		initial := manifest{Entries: map[string]entry{".": {Directory: true}}}
+		if err := store.commit(initial); err != nil {
 			return nil, err
 		}
-		return store, nil
-	}
-	if err != nil {
+	} else if err != nil {
 		return nil, err
 	}
-	store.chunkSize = 0
-	if err := store.load(); err != nil {
+	store.addRefs(store.manifest)
+	if err := store.reconcile(); err != nil {
 		return nil, err
+	}
+	if created {
+		parent, err := os.Open(filepath.Dir(directory))
+		if err != nil {
+			return nil, err
+		}
+		if err := errors.Join(parent.Sync(), parent.Close()); err != nil {
+			return nil, err
+		}
 	}
 	return store, nil
 }
 
-// Path returns the host path of the opaque backing blob.
+// Close releases store ownership. Close is idempotent, but returns ErrBusy while
+// any reader or writer remains open. Close or abort those handles and retry.
+func (s *Store) Close() error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if s.closed {
+		return nil
+	}
+	if s.handles != 0 {
+		return ErrBusy
+	}
+	if err := s.collect(); err != nil {
+		return err
+	}
+	s.closed = true
+	return errors.Join(s.chunks.Close(), s.root.Close(), s.owner.Close())
+}
+
+// Path returns the host directory containing this store.
 func (s *Store) Path() string { return s.path }
 
 // ChunkSize returns the store's plaintext chunk size.
@@ -116,12 +179,9 @@ func (s *Store) Mkdir(name string) error {
 	if item, ok := s.manifest.Entries[parent]; !ok || !item.Directory {
 		return &fs.PathError{Op: "mkdir", Path: name, Err: fs.ErrNotExist}
 	}
-	s.manifest.Entries[name] = entry{Directory: true}
-	if err := s.commit(nil); err != nil {
-		delete(s.manifest.Entries, name)
-		return err
-	}
-	return nil
+	next := cloneManifest(s.manifest)
+	next.Entries[name] = entry{Directory: true}
+	return s.commit(next)
 }
 
 // MkdirAll creates a directory and all missing parents.
@@ -175,12 +235,9 @@ func (s *Store) Remove(name string) error {
 			}
 		}
 	}
-	delete(s.manifest.Entries, name)
-	if err := s.commit(nil); err != nil {
-		s.manifest.Entries[name] = item
-		return err
-	}
-	return nil
+	next := cloneManifest(s.manifest)
+	delete(next.Entries, name)
+	return s.commit(next)
 }
 
 // WriteFile replaces name with data read through a bounded chunk buffer.

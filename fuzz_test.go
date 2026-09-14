@@ -22,15 +22,12 @@ func FuzzDecodeHeader(f *testing.F) {
 }
 
 func FuzzDecodeAndValidateManifest(f *testing.F) {
-	f.Add([]byte(`{"entries":{".":{"directory":true}}}`), int64(0), defaultChunkSize)
-	f.Add([]byte(`{"entries":{".":{"directory":true},"file":{"size":1,"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","chunks":[{"offset":0,"size":1}]}}}`), int64(17), defaultChunkSize)
-	f.Add([]byte(`{"entries":null}`), int64(0), defaultChunkSize)
+	f.Add([]byte(`{"entries":{".":{"directory":true}}}`), defaultChunkSize)
+	f.Add([]byte(`{"entries":{".":{"directory":true},"file":{"size":1,"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","chunks":[{"offset":0,"size":1}]}}}`), defaultChunkSize)
+	f.Add([]byte(`{"entries":null}`), defaultChunkSize)
 
-	f.Fuzz(func(t *testing.T, encoded []byte, dataSize int64, chunkSize int) {
+	f.Fuzz(func(t *testing.T, encoded []byte, chunkSize int) {
 		// Keep fuzz-controlled bounds within the format's supported domain.
-		if dataSize < 0 || dataSize > int64(len(encoded))+maximumChunkSize {
-			t.Skip()
-		}
 		if chunkSize < minimumChunkSize || chunkSize > maximumChunkSize {
 			t.Skip()
 		}
@@ -40,21 +37,23 @@ func FuzzDecodeAndValidateManifest(f *testing.F) {
 		if err != nil {
 			return
 		}
-		_ = validateManifest(value, dataSize, chunkSize)
+		_ = validateManifest(value, chunkSize)
 	})
 }
 
 func FuzzOpenStore(f *testing.F) {
-	// Seed the end-to-end target with both a valid blob and malformed inputs.
+	// Seed the end-to-end target with both a valid manifest and malformed inputs.
 	seedPath := filepath.Join(f.TempDir(), "seed.sandboxed")
 	store, err := OpenStore(seedPath, WithChunkSize(minimumChunkSize))
 	if err != nil {
 		f.Fatal(err)
 	}
-	if err := store.WriteFile("file", bytes.NewReader(bytes.Repeat([]byte("seed"), 2048))); err != nil {
+	putFile(f, store, "file", bytes.Repeat([]byte("seed"), 2048))
+	chunks := chunkFiles(f, store)
+	if err := store.Close(); err != nil {
 		f.Fatal(err)
 	}
-	valid, err := os.ReadFile(seedPath)
+	valid, err := os.ReadFile(filepath.Join(seedPath, "manifest"))
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -62,9 +61,20 @@ func FuzzOpenStore(f *testing.F) {
 	f.Add([]byte("not a store"))
 	f.Add([]byte{})
 
-	f.Fuzz(func(t *testing.T, blob []byte) {
+	f.Fuzz(func(t *testing.T, encoded []byte) {
 		filename := filepath.Join(t.TempDir(), "fuzz.sandboxed")
-		if err := os.WriteFile(filename, blob, 0600); err != nil {
+		if err := os.Mkdir(filename, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(filename, "chunks"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		for name, data := range chunks {
+			if err := os.WriteFile(filepath.Join(filename, "chunks", name), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(filename, "manifest"), encoded, 0600); err != nil {
 			t.Fatal(err)
 		}
 
@@ -73,6 +83,7 @@ func FuzzOpenStore(f *testing.F) {
 		if err != nil {
 			return
 		}
+		defer store.Close()
 		err = fs.WalkDir(store, ".", func(name string, item fs.DirEntry, walkErr error) error {
 			if walkErr != nil || item.IsDir() {
 				return walkErr
@@ -87,10 +98,4 @@ func FuzzOpenStore(f *testing.F) {
 		})
 		_ = err
 	})
-}
-
-func FuzzDecodeCommitRoot(f *testing.F) {
-	f.Add(encodeRoot(commitRoot{header: header{ChunkSize: minimumChunkSize}, generation: 1, offset: dataStart}))
-	f.Add([]byte("incomplete commit"))
-	f.Fuzz(func(t *testing.T, data []byte) { _, _ = decodeRoot(data) })
 }

@@ -5,22 +5,17 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
 	"path"
 	"sort"
+	"sync"
 	"time"
 )
 
-type pendingFile struct {
-	name   string
-	file   *os.File
-	chunks map[int]chunk // nil stages every chunk; otherwise only these indices.
-}
-
 type openFile struct {
+	mutex      sync.Mutex
+	store      *Store
 	name       string
 	entry      entry
-	file       *os.File
 	offset     int64
 	chunkIndex int
 	plain      []byte
@@ -42,29 +37,40 @@ func (s *Store) Open(name string) (fs.File, error) {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
 	}
 
-	// Open the same blob snapshot used by this manifest before releasing the lock.
-	file, err := os.Open(s.path)
-	if err != nil {
-		return nil, err
-	}
-
-	// Return the specialized virtual handle for this entry type.
+	s.handles++
 	if item.Directory {
-		return &directoryFile{store: s, file: file, name: name}, nil
+		return &directoryFile{store: s, name: name}, nil
 	}
-	return &openFile{name: name, entry: item, file: file, chunkIndex: -1}, nil
+	s.retain(item)
+	return &openFile{store: s, name: name, entry: item, chunkIndex: -1}, nil
 }
 
 func (f *openFile) Stat() (fs.FileInfo, error) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
 	if f.closed {
 		return nil, fs.ErrClosed
 	}
 	return fileInfo{name: path.Base(f.name), size: f.entry.Size}, nil
 }
 
-func (f *openFile) Close() error { f.closed = true; return f.file.Close() }
+func (f *openFile) Close() error {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	if f.closed {
+		return fs.ErrClosed
+	}
+	f.closed = true
+	f.store.lock.Lock()
+	defer f.store.lock.Unlock()
+	f.store.handles--
+	f.store.release(f.entry)
+	return f.store.collect()
+}
 
 func (f *openFile) Read(p []byte) (int, error) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
 	// Validate the reader state before locating ciphertext.
 	if f.closed {
 		return 0, fs.ErrClosed
@@ -96,6 +102,8 @@ func (f *openFile) Read(p []byte) (int, error) {
 }
 
 func (f *openFile) Seek(offset int64, whence int) (int64, error) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
 	if f.closed {
 		return 0, fs.ErrClosed
 	}
@@ -129,22 +137,10 @@ func (f *openFile) chunkAt(offset int64) (int, int64) {
 }
 
 func (f *openFile) loadChunk(index int, start int64) error {
-	// Read only the requested ciphertext range from the immutable blob snapshot.
 	part := f.entry.Chunks[index]
-	ciphertext := make([]byte, part.Size+16)
-	if _, err := f.file.ReadAt(ciphertext, part.Offset); err != nil {
-		return fmt.Errorf("read chunk %d for %q: %w", index, f.name, err)
-	}
-
-	// Authenticate the chunk metadata before exposing any plaintext.
-	key := chunkKey(f.entry.Key, part.ID)
-	aead, err := fileAEAD(key)
+	plain, err := f.store.readChunk(f.entry.Key, index, part)
 	if err != nil {
 		return err
-	}
-	plain, err := aead.Open(nil, chunkNonce(key, uint64(index)), ciphertext, chunkAdditionalData(uint64(index), part.Size))
-	if err != nil {
-		return fmt.Errorf("decrypt chunk %d for %q: %w", index, f.name, err)
 	}
 
 	f.chunkIndex, f.plainStart, f.plain = index, start, plain
@@ -153,24 +149,44 @@ func (f *openFile) loadChunk(index int, start int64) error {
 }
 
 type directoryFile struct {
+	mutex  sync.Mutex
 	store  *Store
-	file   *os.File
 	name   string
 	offset int
 	closed bool
 }
 
 func (d *directoryFile) Stat() (fs.FileInfo, error) {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
 	if d.closed {
 		return nil, fs.ErrClosed
 	}
 	return fileInfo{name: path.Base(d.name), directory: true}, nil
 }
-func (d *directoryFile) Close() error { d.closed = true; return d.file.Close() }
+func (d *directoryFile) Close() error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	if d.closed {
+		return fs.ErrClosed
+	}
+	d.closed = true
+	d.store.lock.Lock()
+	defer d.store.lock.Unlock()
+	d.store.handles--
+	return nil
+}
 func (d *directoryFile) Read([]byte) (int, error) {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	if d.closed {
+		return 0, fs.ErrClosed
+	}
 	return 0, &fs.PathError{Op: "read", Path: d.name, Err: errors.New("is a directory")}
 }
 func (d *directoryFile) ReadDir(count int) ([]fs.DirEntry, error) {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
 	if d.closed {
 		return nil, fs.ErrClosed
 	}

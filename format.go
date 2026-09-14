@@ -43,7 +43,7 @@ type entry struct {
 
 type chunk struct {
 	ID     []byte `json:"id,omitempty"`
-	Offset int64  `json:"offset"`
+	Offset int64  `json:"-"`
 	Size   int    `json:"size"`
 }
 
@@ -177,51 +177,6 @@ func chunkKey(key, id []byte) []byte {
 	hash := hmac.New(sha256.New, key)
 	hash.Write(id)
 	return hash.Sum(nil)
-}
-
-// Separate commit slots keep a torn overwrite away from the preceding root.
-const (
-	rootSize    = 144
-	rootSpacing = 4096
-	dataStart   = 3 * rootSpacing
-)
-
-type commitRoot struct {
-	header     header
-	generation uint64
-	offset     int64
-	digest     [32]byte
-}
-
-func encodeRoot(root commitRoot) []byte {
-	buffer := make([]byte, rootSize)
-	copy(buffer, encodeHeader(root.header))
-	binary.BigEndian.PutUint64(buffer[64:72], root.generation)
-	binary.BigEndian.PutUint64(buffer[72:80], uint64(root.offset))
-	copy(buffer[80:112], root.digest[:])
-	sum := sha256.Sum256(buffer[:112])
-	copy(buffer[112:], sum[:])
-	return buffer
-}
-
-func decodeRoot(buffer []byte) (commitRoot, error) {
-	if len(buffer) != rootSize {
-		return commitRoot{}, fmt.Errorf("invalid commit size")
-	}
-	sum := sha256.Sum256(buffer[:112])
-	if string(sum[:]) != string(buffer[112:]) {
-		return commitRoot{}, fmt.Errorf("incomplete commit record")
-	}
-	h, err := decodeHeader(buffer[:headerSize])
-	if err != nil {
-		return commitRoot{}, err
-	}
-	root := commitRoot{header: h, generation: binary.BigEndian.Uint64(buffer[64:72]), offset: int64(binary.BigEndian.Uint64(buffer[72:80]))}
-	copy(root.digest[:], buffer[80:112])
-	if root.generation == 0 {
-		return commitRoot{}, fmt.Errorf("invalid commit generation")
-	}
-	return root, nil
 }
 
 // sealChunk creates a fresh encryption context even when a write is later

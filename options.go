@@ -20,8 +20,8 @@ type config struct {
 // Option configures a Store when it is first created or opened.
 type Option func(*config) error
 
-// WithFileMode sets the permission bits used for the backing blob and atomic
-// replacement files. The default is 0600.
+// WithFileMode sets permissions for manifests, chunks, and temporary files.
+// The default is 0600. Store directories and the ownership lock remain private.
 func WithFileMode(mode fs.FileMode) Option {
 	return func(config *config) error {
 		if mode != mode.Perm() {
