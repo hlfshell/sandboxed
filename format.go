@@ -31,7 +31,8 @@ type header struct {
 }
 
 type manifest struct {
-	Entries map[string]entry `json:"entries"`
+	Entries  map[string]entry `json:"entries"`
+	Sequence uint64           `json:"sequence,omitempty"`
 }
 
 type entry struct {

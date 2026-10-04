@@ -139,7 +139,7 @@ func TestProcessCrashReleasesOwnershipAndRecoversOrphans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 3 {
+	if len(entries) != 4 {
 		t.Fatalf("abandoned staging survived: %v", entries)
 	}
 }

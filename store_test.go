@@ -227,7 +227,11 @@ func TestPayloadIsNeverStoredAsPlaintext(t *testing.T) {
 		}
 	}
 
-	if !bytes.Contains(raw, []byte("recognizable-name.txt")) {
+	wal, err := os.ReadFile(filepath.Join(filename, "wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(wal, []byte("recognizable-name.txt")) {
 		t.Fatal("unencrypted manifest should keep pathing readable")
 	}
 }

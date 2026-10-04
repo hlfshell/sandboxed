@@ -1,7 +1,6 @@
 package sandboxed
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -41,7 +40,7 @@ type File struct {
 	// Scratch buffers are bounded by chunk size and never exposed to callers.
 	plain      []byte
 	ciphertext []byte
-	stagingEnd int64
+	staging    map[int]string
 }
 
 // Bound logical chunk positions and per-file metadata before accepting offsets.
@@ -101,14 +100,11 @@ func (s *Store) openWritable(name string, replace bool) (*File, error) {
 	} else {
 		item.Chunks = append([]chunk(nil), base.Chunks...)
 	}
-	result := &File{store: s, source: &openFile{store: s, name: name, entry: base}, item: item, existed: exists, changed: replace, dirty: make(map[int]chunk)}
-	result.file, err = s.temporary(".staging-")
-	if err != nil {
-		return nil, err
-	}
+	result := &File{store: s, source: &openFile{store: s, name: name, entry: base, writable: true}, item: item, existed: exists, changed: replace, dirty: make(map[int]chunk), staging: make(map[int]string)}
 
 	result.indexChunks()
 	s.handles++
+	s.writers++
 	s.retain(base)
 	return result, nil
 }
@@ -251,7 +247,11 @@ func (f *File) loadChunk(index int) ([]byte, error) {
 		return plain, nil
 	}
 	ciphertext := resizeBuffer(f.plain, part.Size+16)
-	if _, err := f.file.ReadAt(ciphertext, part.Offset); err != nil {
+	file, err := f.stagingFile(index)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := file.ReadAt(ciphertext, 0); err != nil {
 		return nil, err
 	}
 	plain, err := decryptChunkInto(ciphertext[:0], f.item.Key, index, part, ciphertext)
@@ -389,18 +389,19 @@ func (f *File) stageChunk(index int, plain []byte) error {
 	}
 	f.ciphertext = ciphertext
 
-	// A private fixed-capacity slot is rewritten with a fresh encryption context
-	// on every edit. Published chunks remain immutable and never share these slots.
-	previous, exists := f.dirty[index]
-	part.Offset = previous.Offset
-	if !exists {
-		part.Offset = f.stagingEnd
+	// Reuse a private ciphertext file for this chunk. Publication renames it;
+	// no payload bytes are copied at commit and no plaintext reaches the file.
+	file, err := f.stagingFile(index)
+	if err != nil {
+		return err
 	}
-	if _, err := f.file.WriteAt(ciphertext, part.Offset); err != nil {
+	if _, err := file.WriteAt(ciphertext, 0); err != nil {
 		return fmt.Errorf("stage file chunk: %w", err)
 	}
-	if !exists {
-		f.stagingEnd += int64(f.store.chunkSize) + 16
+	if previous, exists := f.dirty[index]; exists && previous.Size > len(plain) {
+		if err := file.Truncate(int64(len(ciphertext))); err != nil {
+			return err
+		}
 	}
 	position, exists := f.chunkPosition(index)
 	if exists {
@@ -438,66 +439,10 @@ func (f *File) Close() (err error) {
 	if !f.changed {
 		return nil
 	}
-	if err := f.store.lockLatest(); err != nil {
-		return err
-	}
-	defer f.store.unlockLatest()
-	previous, exists := f.store.manifest.Entries[f.source.name]
-	if exists != f.existed || (exists && (previous.Directory || !bytes.Equal(previous.Key, f.source.entry.Key) || !bytes.Equal(previous.Revision, f.source.entry.Revision))) {
-		return ErrConflict
-	}
-
-	parent, ok := f.store.manifest.Entries[path.Dir(f.source.name)]
-	if !ok || !parent.Directory {
-		return ErrConflict
-	}
-
-	// Publish each changed chunk under its immutable random name. Cleanup cannot
-	// run concurrently because this commit holds the store mutex.
-	published := false
-	for _, part := range f.item.Chunks {
-		if _, dirty := f.dirty[part.Index]; !dirty {
-			continue
-		}
-		name := chunkName(part)
-		output, err := openInternal(f.store.chunks, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL, f.store.fileMode)
-		if err != nil {
-			return err
-		}
-		f.store.garbage[[32]byte(part.ID)] = struct{}{}
-		// Reuse encryption scratch for publication instead of allocating a copy
-		// buffer for every chunk. Hide optional copy methods that allocate their
-		// own buffers; all edits are complete and this scratch is now disposable.
-		length := int64(part.Size + 16)
-		buffer := f.ciphertext[:min(cap(f.ciphertext), f.store.chunkSize+16)]
-		reader := io.NewSectionReader(f.file, part.Offset, length)
-		n, copyErr := io.CopyBuffer(struct{ io.Writer }{output}, struct{ io.Reader }{reader}, buffer)
-		if copyErr == nil && n != length {
-			copyErr = io.ErrUnexpectedEOF
-		}
-		err = errors.Join(copyErr, output.Sync(), output.Close())
-		if err != nil {
-			return fmt.Errorf("publish chunk: %w", err)
-		}
-		published = true
-	}
-	// Hole-only size changes publish metadata without a payload-directory change.
-	if published {
-		if err := f.store.chunks.Sync(); err != nil {
-			return err
-		}
-	}
-	revision, err := randomKey()
-	if err != nil {
-		return err
-	}
-	f.item.Revision = revision
 	if f.positions != nil {
 		sort.Slice(f.item.Chunks, func(i, j int) bool { return f.item.Chunks[i].Index < f.item.Chunks[j].Index })
 	}
-	next := cloneManifest(f.store.manifest)
-	next.Entries[f.source.name] = f.item
-	return f.store.commit(next, f.source.name)
+	return f.store.submit(f)
 }
 
 // Abort discards staged updates and releases resources. It is safe to defer,
@@ -515,7 +460,15 @@ func (f *File) Abort() error {
 func (f *File) cleanup() error {
 	clear(f.plain[:cap(f.plain)])
 	f.plain, f.ciphertext = nil, nil
-	return errors.Join(f.file.Close(), removeInternal(f.store.root, f.file.Name()), f.source.Close())
+	var err error
+	if f.file != nil {
+		err = f.file.Close()
+		f.file = nil
+	}
+	for _, name := range f.staging {
+		err = errors.Join(err, removeInternal(f.store.root, name))
+	}
+	return errors.Join(err, f.source.Close())
 }
 
 // Writable layouts append newly allocated chunks in any order. Build an index
@@ -539,4 +492,31 @@ func (f *File) chunkPosition(index int) (int, bool) {
 		return position, exists
 	}
 	return index, index < len(f.item.Chunks)
+}
+
+// Cache only one descriptor per writer, even when it touches many chunks.
+func (f *File) stagingFile(index int) (*os.File, error) {
+	name, exists := f.staging[index]
+	if f.file != nil && f.file.Name() == name {
+		return f.file, nil
+	}
+	if f.file != nil {
+		if err := f.file.Close(); err != nil {
+			return nil, err
+		}
+		f.file = nil
+	}
+	var file *os.File
+	var err error
+	if exists {
+		file, err = openInternal(f.store.root, name, unix.O_RDWR, 0)
+	} else {
+		file, err = f.store.temporary(".staging-")
+	}
+	if err != nil {
+		return nil, err
+	}
+	f.file = file
+	f.staging[index] = file.Name()
+	return file, nil
 }

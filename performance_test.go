@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -113,12 +114,16 @@ func TestStagingSpaceTracksDistinctChunks(t *testing.T) {
 		if err != nil || !bytes.Equal(plain, data[index*minimumChunkSize:(index+1)*minimumChunkSize]) {
 			t.Fatalf("write did not immediately stage authenticated ciphertext: %v", err)
 		}
-		info, err := file.file.Stat()
-		if err != nil {
-			t.Fatal(err)
+		var stagingBytes int64
+		for _, name := range file.staging {
+			info, err := os.Stat(filepath.Join(store.Path(), name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			stagingBytes += info.Size()
 		}
-		if info.Size() > 3*(minimumChunkSize+16) {
-			t.Fatalf("staging grew to %d bytes", info.Size())
+		if len(file.staging) > 3 || stagingBytes > 3*(minimumChunkSize+16) {
+			t.Fatalf("staging grew to %d bytes across %d chunks", stagingBytes, len(file.staging))
 		}
 	}
 

@@ -15,23 +15,38 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Store owns a directory of encrypted chunks and a private manifest. Store implements
+// Store owns encrypted chunks, a checkpoint manifest, and a write-ahead log. It implements
 // fs.FS, fs.ReadFileFS, fs.ReadDirFS, and fs.StatFS.
 type Store struct {
-	path          string
-	chunkSize     int
-	key           []byte
-	fileMode      fs.FileMode
-	manifest      manifest
-	lock          sync.Mutex
-	root          *os.File
-	chunks        *os.File
-	owner         *os.File
-	refs          map[[32]byte]int
-	garbage       map[[32]byte]struct{}
-	handles       int
-	closed        bool
-	manifestDirty bool
+	path            string
+	chunkSize       int
+	key             []byte
+	fileMode        fs.FileMode
+	manifest        manifest
+	lock            sync.Mutex
+	root            *os.File
+	chunks          *os.File
+	owner           *os.File
+	refs            map[[32]byte]int
+	garbage         map[[32]byte]int64
+	handles         int
+	writers         int
+	closed          bool
+	manifestDirty   bool
+	entrySizes      map[string]int64
+	metadataSize    int64
+	wal             journalFile
+	walSize         int64
+	walErr          error
+	commits         chan *commitRequest
+	stop            chan struct{}
+	cleanupWake     chan struct{}
+	workers         sync.WaitGroup
+	cleanupErr      error
+	garbageBytes    int64
+	walGroups       uint64
+	walBytes        uint64
+	checkpointCount uint64
 }
 
 // ErrBusy means the store is already owned, or still has open file handles.
@@ -76,11 +91,14 @@ func OpenStore(directory string, options ...Option) (_ *Store, err error) {
 		fileMode:      config.fileMode,
 		root:          root,
 		refs:          make(map[[32]byte]int),
-		garbage:       make(map[[32]byte]struct{}),
+		garbage:       make(map[[32]byte]int64),
 		manifestDirty: true,
 	}
 	defer func() {
 		if err != nil {
+			if store.wal != nil {
+				store.wal.Close()
+			}
 			if store.chunks != nil {
 				store.chunks.Close()
 			}
@@ -117,7 +135,25 @@ func OpenStore(directory string, options ...Option) (_ *Store, err error) {
 			return nil, fmt.Errorf("missing manifest with existing chunks")
 		}
 		initial := manifest{Entries: map[string]entry{".": {Directory: true}}}
-		if err := store.commit(initial); err != nil {
+		if info, statErr := openInternal(root, "wal", unix.O_RDONLY, 0); statErr == nil {
+			stat, e := info.Stat()
+			info.Close()
+			if e != nil || stat.Size() != 0 {
+				return nil, fmt.Errorf("missing manifest with existing WAL")
+			}
+		} else if !errors.Is(statErr, fs.ErrNotExist) {
+			return nil, statErr
+		}
+		// Establish the empty WAL before publishing a checkpoint that requires it.
+		// A crash before the checkpoint leaves a safely restartable empty store.
+		store.manifest = initial
+		if err := store.openWAL(true); err != nil {
+			return nil, err
+		}
+		if err := store.wal.Sync(); err != nil {
+			return nil, err
+		}
+		if err := store.checkpoint(initial); err != nil {
 			return nil, err
 		}
 	} else if err != nil {
@@ -136,6 +172,7 @@ func OpenStore(directory string, options ...Option) (_ *Store, err error) {
 			return nil, err
 		}
 	}
+	store.startWorkers()
 	return store, nil
 }
 
@@ -143,18 +180,35 @@ func OpenStore(directory string, options ...Option) (_ *Store, err error) {
 // any reader or writer remains open. Close or abort those handles and retry.
 func (s *Store) Close() error {
 	s.lock.Lock()
-	defer s.lock.Unlock()
 	if s.closed {
+		s.lock.Unlock()
 		return nil
 	}
 	if s.handles != 0 {
+		s.lock.Unlock()
 		return ErrBusy
 	}
-	if err := s.collect(); err != nil {
-		return err
+	// Leave the WAL intact on uncertain I/O; reopening performs recovery.
+	var err error
+	if s.walErr == nil {
+		if s.walSize != 0 || s.manifestDirty {
+			err = s.flushCheckpoint()
+		}
+		if err == nil {
+			for len(s.garbage) != 0 {
+				if err = s.collect(); err != nil {
+					break
+				}
+			}
+		}
+	} else {
+		err = s.walErr
 	}
 	s.closed = true
-	return errors.Join(s.chunks.Close(), s.root.Close(), s.owner.Close())
+	close(s.stop)
+	s.lock.Unlock()
+	s.workers.Wait()
+	return errors.Join(err, s.wal.Close(), s.chunks.Close(), s.root.Close(), s.owner.Close())
 }
 
 // Path returns the host directory containing this store.

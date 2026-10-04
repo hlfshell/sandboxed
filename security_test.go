@@ -12,7 +12,7 @@ import (
 )
 
 func TestStoreRejectsInternalSymlinks(t *testing.T) {
-	for _, target := range []string{"manifest", "lock", "chunks", "chunk"} {
+	for _, target := range []string{"manifest", "wal", "lock", "chunks", "chunk"} {
 		t.Run(target, func(t *testing.T) {
 			store := testStore(t)
 			putFile(t, store, "file", []byte("safe"))
@@ -153,6 +153,7 @@ func TestPrivateDirectoryAndChunkModes(t *testing.T) {
 		filepath.Join(store.path, "chunks"):                        0700,
 		filepath.Join(store.path, "lock"):                          0600,
 		filepath.Join(store.path, "manifest"):                      0640,
+		filepath.Join(store.path, "wal"):                           0640,
 		chunkPath(store, store.manifest.Entries["file"].Chunks[0]): 0640,
 	} {
 		info, err := os.Stat(name)

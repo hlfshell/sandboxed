@@ -92,6 +92,10 @@ func FuzzOpenStore(f *testing.F) {
 			t.Fatal(err)
 		}
 
+		if err := os.WriteFile(filepath.Join(filename, "wal"), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+
 		// Exercise the public parser and every authenticated file stream it accepts.
 		store, err := OpenStore(filename)
 		if err != nil {
@@ -181,5 +185,25 @@ func FuzzFileEditsMatchBytes(f *testing.F) {
 			t.Fatal(err)
 		}
 		assertFile(t, store, "file", expected)
+	})
+}
+
+func FuzzWALChanges(f *testing.F) {
+	f.Add([]byte(`[{"name":"directory","item":{"directory":true},"reset":true}]`))
+	f.Add([]byte(`[{"name":".","item":null}]`))
+	f.Add([]byte(`[{"name":"file","item":{"size":9},"put":[{"index":-1}]}]`))
+	f.Fuzz(func(t *testing.T, encoded []byte) {
+		if len(encoded) > 64<<10 {
+			t.Skip()
+		}
+		var changes []walChange
+		if err := json.Unmarshal(encoded, &changes); err != nil {
+			return
+		}
+		value := manifest{Entries: map[string]entry{".": {Directory: true}}}
+		if err := applyChanges(&value, changes); err != nil {
+			return
+		}
+		_ = validateManifest(value, minimumChunkSize)
 	})
 }

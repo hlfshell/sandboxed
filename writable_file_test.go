@@ -59,7 +59,7 @@ func TestPartialWritesPublishOnlyChangedChunks(t *testing.T) {
 		t.Fatal("reused chunk encryption context")
 	}
 	assertFile(t, store, "file", original)
-	staging, err := os.ReadFile(filepath.Join(store.path, handle.file.Name()))
+	staging, err := os.ReadFile(filepath.Join(store.path, handle.staging[0]))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestPartialWritesPublishOnlyChangedChunks(t *testing.T) {
 	if err != nil || !bytes.Equal(snapshot, original) {
 		t.Fatalf("snapshot changed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(store.path, handle.file.Name())); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(store.path, handle.staging[0])); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("staging survived close: %v", err)
 	}
 	if err := handle.Close(); !errors.Is(err, fs.ErrClosed) {
@@ -177,7 +177,7 @@ func TestPartialWriterConflictsAndUnrelatedCommits(t *testing.T) {
 					}
 				}
 			}
-			if _, err := os.Stat(filepath.Join(store.path, handle.file.Name())); !errors.Is(err, fs.ErrNotExist) {
+			if _, err := os.Stat(filepath.Join(store.path, handle.staging[0])); !errors.Is(err, fs.ErrNotExist) {
 				t.Fatalf("staging survived: %v", err)
 			}
 		})
@@ -199,7 +199,7 @@ func TestFileAbortAndNoOpReleaseResources(t *testing.T) {
 	if err := handle.Close(); !errors.Is(err, fs.ErrClosed) {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(store.path, handle.file.Name())); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(store.path, handle.staging[0])); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("abort left staging: %v", err)
 	}
 	noop := openWritable(t, store, "file")
@@ -232,7 +232,7 @@ func TestFileAuthenticationFailureDoesNotPublish(t *testing.T) {
 		offset := int64(0)
 		if staged {
 			writeAt(t, handle, []byte("changed"), 0)
-			target = filepath.Join(store.path, handle.file.Name())
+			target = filepath.Join(store.path, handle.staging[0])
 			offset = handle.item.Chunks[0].Offset
 		}
 		file, err := os.OpenFile(target, os.O_RDWR, 0)

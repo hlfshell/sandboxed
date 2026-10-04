@@ -135,7 +135,7 @@ cases therefore have only one operation per sample.
 These measurements identified staging amplification and linear chunk lookup.
 The subsequent implementation changes replace append-only staging edits with
 reusable slots, reuse encryption buffers, and calculate chunk locations directly.
-Chunk-local publication and cleanup checks passed. Full-manifest serialization
+Chunk-local publication and cleanup checks passed. Checkpoint serialization
 and immediate re-encryption remain costs to measure for the intended workload. This run does not establish peak-memory bounds
 or tail-latency targets.
 
@@ -160,3 +160,30 @@ block allocation and directory overhead are not included in `stored-payload-B`.
 Dense workloads remain in the suite to detect lookup, metadata, and commit
 regressions. Sparse random allocation includes sorting at commit; lookup-only
 measurements expose binary-search scaling separately from encryption and syncs.
+
+## WAL and durable small writes
+
+```sh
+BENCH='Benchmark(DurableSmallWrites|WAL|RandomWriteBatch|SuiteStagedWrites)' BENCHTIME=200ms COUNT=5 CPU=4 ./scripts/benchmark.sh
+```
+
+`DurableSmallWrites` measures 64-byte replacements through successful Close,
+with 1/8 workers and 1/128 unrelated directories. It includes a final cleanup
+drain in the timed interval, reports allocation costs and sampled p50/p95/p99
+call latency, WAL bytes and WAL syncs per operation, and verifies the final payloads. Latencies include staging and
+queue waits. Samples are bounded to the first 4,096 operations per worker;
+short runs do not establish production tail-latency guarantees.
+
+`WALDelta` reports actual appended metadata bytes and WAL syncs per single-chunk
+patch in files with 1/128 chunks. `WALCheckpoint` isolates full checkpoint cost
+at 128 directories. `WALCleanup` times reclaiming 64/256 chunks in bounded
+passes, excluding encrypted fixture creation. Checkpoint and cleanup timings
+are separate from normal commit timings. WAL bytes exclude payload writes,
+filesystem journal traffic, and checkpoints.
+
+Keep staged-write and dense read/write benchmarks in comparisons: avoiding the
+publication copy introduces a private file per dirty chunk, and group collection
+can add up to 1 ms before I/O for a solitary Close. Each changed chunk still
+needs a payload sync. The WAL does not remove whole-chunk encryption, in-memory
+metadata traversal, or checkpoint cost. Store shutdown drains remaining cleanup
+and writes a checkpoint outside ordinary benchmark timing.

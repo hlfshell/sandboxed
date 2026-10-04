@@ -20,7 +20,7 @@ type config struct {
 // Option configures a Store when it is first created or opened.
 type Option func(*config) error
 
-// WithFileMode sets permissions for manifests, chunks, and temporary files.
+// WithFileMode sets permissions for manifests, the WAL, chunks, and temporary files.
 // The default is 0600. Store directories and the ownership lock remain private.
 func WithFileMode(mode fs.FileMode) Option {
 	return func(config *config) error {
@@ -44,7 +44,7 @@ func WithChunkSize(size int) Option {
 	}
 }
 
-// WithEncryption encrypts the store manifest, including paths and file keys.
+// WithEncryption encrypts the checkpoint and WAL metadata, including paths and file keys.
 // key must contain 32 bytes. Payload chunks are encrypted in every store.
 func WithEncryption(key []byte) Option {
 	return func(config *config) error {

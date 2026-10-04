@@ -12,7 +12,8 @@ import (
 )
 
 // All BenchmarkSuite cases exclude fixture creation and final verification.
-// Mutations include Close (encryption, publication, syncs and normal cleanup).
+// Mutations include Close (encryption, publication, and durable commit).
+// Deferred cleanup can overlap measurements; fixture cleanup drains the remainder.
 const benchMiB = 1 << 20
 
 func benchData(n int) []byte {
@@ -56,7 +57,7 @@ func benchStore(b *testing.B, chunk int, encrypted bool) *Store {
 		}
 		entries, err := os.ReadDir(s.Path())
 		benchCheck(b, err)
-		if len(entries) != 3 {
+		if len(entries) != 4 {
 			b.Errorf("unexpected staging files: %v", entries)
 		}
 	})

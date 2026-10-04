@@ -57,6 +57,14 @@ func chunkPath(store *Store, part chunk) string {
 }
 func chunkFiles(t testing.TB, store *Store) map[string][]byte {
 	t.Helper()
+	// Tests inspecting physical inventory explicitly drain deferred cleanup.
+	if !store.closed {
+		if err := store.Cleanup(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.lock.Lock()
+	defer store.lock.Unlock()
 	entries, err := os.ReadDir(filepath.Join(store.path, "chunks"))
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +200,7 @@ func TestWriterSnapshotAndStagingSurviveCleanup(t *testing.T) {
 	putFile(t, store, "file", bytes.Repeat([]byte("a"), minimumChunkSize*2))
 	writer := openWritable(t, store, "file")
 	writeAt(t, writer, []byte("ours"), 0)
-	staging := filepath.Join(store.path, writer.file.Name())
+	staging := filepath.Join(store.path, writer.staging[0])
 	putFile(t, store, "file", []byte("theirs"))
 	if err := store.Cleanup(context.Background()); err != nil {
 		t.Fatal(err)
@@ -321,7 +329,7 @@ func TestFailedChunkPublicationLeavesStoreUsable(t *testing.T) {
 	putFile(t, store, "file", []byte("original"))
 	writer := createVirtual(t, store, "file")
 	writeAt(t, writer, bytes.Repeat([]byte("a"), minimumChunkSize*2), 0)
-	if err := writer.file.Truncate(minimumChunkSize + 16 + 3); err != nil {
+	if err := writer.file.Truncate(3); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Close(); err == nil {
@@ -370,11 +378,11 @@ func TestManifestDamageFailsBeforeStartupCleanup(t *testing.T) {
 func TestMissingLiveChunkDoesNotResetManifest(t *testing.T) {
 	store := testStore(t)
 	putFile(t, store, "file", []byte("data"))
-	original := manifestBytes(t, store)
 	part := store.manifest.Entries["file"].Chunks[0]
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
+	original := manifestBytes(t, store)
 	if err := os.Remove(chunkPath(store, part)); err != nil {
 		t.Fatal(err)
 	}
@@ -399,18 +407,23 @@ func TestCleanupFailureDoesNotRollbackPublishedManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A directory cannot be removed with the chunk-file unlink operation.
-	if err := store.Remove("file"); err == nil {
+	if err := store.Remove("file"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Cleanup(context.Background()); err == nil {
 		t.Fatal("cleanup error was hidden")
 	}
 	if _, err := store.Open("file"); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatal("rolled back committed removal", err)
 	}
+	store.lock.Lock()
 	if err := os.Remove(name); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(saved, name); err != nil {
 		t.Fatal(err)
 	}
+	store.lock.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := store.Cleanup(ctx); !errors.Is(err, context.Canceled) {
@@ -438,6 +451,9 @@ func TestFailedManifestPublicationDiscardsNewChunks(t *testing.T) {
 	if err := os.Mkdir(name, 0700); err != nil {
 		t.Fatal(err)
 	}
+	store.lock.Lock()
+	store.walSize = checkpointBytes
+	store.lock.Unlock()
 	writer := createVirtual(t, store, "file")
 	writeAt(t, writer, []byte("new"), 0)
 	if err := writer.Close(); err == nil {
@@ -457,7 +473,7 @@ func TestFailedManifestPublicationDiscardsNewChunks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 3 {
+	if len(entries) != 4 {
 		t.Fatal("failed commit leaked temporary files")
 	}
 }

@@ -17,11 +17,11 @@ mkdir -p "$output"
  if command -v lscpu >/dev/null; then lscpu; fi
  df -T "$TMPDIR"
  printf 'BENCH=%s\nBENCHTIME=%s\nCOUNT=%s\nCPU=%s\nTMPDIR=%s\n' \
-  "${BENCH:-Benchmark(Suite|Sparse|LookupScaling|RandomWriteBatch|PartialWrite)}" "${BENCHTIME:-1s}" "${COUNT:-5}" "${CPU:-1,4}" "$TMPDIR"
+  "${BENCH:-Benchmark(Suite|Sparse|LookupScaling|RandomWriteBatch|PartialWrite|DurableSmallWrites|WAL)}" "${BENCHTIME:-1s}" "${COUNT:-5}" "${CPU:-1,4}" "$TMPDIR"
 } > "$output/environment.txt"
 go test ./... -count=1 2>&1 | tee "$output/tests.txt"
 go test ./... -race -count=1 2>&1 | tee "$output/race.txt"
-go test -run '^$' -bench "${BENCH:-Benchmark(Suite|Sparse|LookupScaling|RandomWriteBatch|PartialWrite)}" -benchmem \
+go test -run '^$' -bench "${BENCH:-Benchmark(Suite|Sparse|LookupScaling|RandomWriteBatch|PartialWrite|DurableSmallWrites|WAL)}" -benchmem \
  -benchtime "${BENCHTIME:-1s}" -count "${COUNT:-5}" -cpu "${CPU:-1,4}" \
  -timeout "${TIMEOUT:-60m}" 2>&1 | tee "$output/bench.txt"
 printf 'Results: %s\n' "$output"

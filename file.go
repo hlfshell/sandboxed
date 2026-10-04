@@ -21,6 +21,7 @@ type openFile struct {
 	plainStart int64
 	plainEnd   int64
 	closed     bool
+	writable   bool
 }
 
 func (s *Store) Open(name string) (fs.File, error) {
@@ -65,8 +66,12 @@ func (f *openFile) Close() error {
 	f.store.lock.Lock()
 	defer f.store.lock.Unlock()
 	f.store.handles--
+	if f.writable {
+		f.store.writers--
+	}
 	f.store.release(f.entry)
-	return f.store.collect()
+	f.store.requestCleanup()
+	return nil
 }
 
 func (f *openFile) Read(p []byte) (int, error) {

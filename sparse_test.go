@@ -82,7 +82,11 @@ func TestSparseAllocationRoundTrip(t *testing.T) {
 				// Every allocated record is already authenticated ciphertext before Close.
 				for _, part := range file.item.Chunks {
 					ciphertext := make([]byte, part.Size+16)
-					if _, err := file.file.ReadAt(ciphertext, part.Offset); err != nil {
+					staged, err := file.stagingFile(part.Index)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := staged.ReadAt(ciphertext, 0); err != nil {
 						t.Fatal(err)
 					}
 					if _, err := decryptChunk(file.item.Key, part.Index, part, ciphertext); err != nil {
@@ -514,6 +518,9 @@ func TestFailedSparsePublicationKeepsCommittedLayout(t *testing.T) {
 				if err := os.Mkdir(name, 0700); err != nil {
 					t.Fatal(err)
 				}
+				store.lock.Lock()
+				store.walSize = checkpointBytes
+				store.lock.Unlock()
 				defer func() {
 					if err := os.Remove(name); err != nil {
 						t.Error(err)

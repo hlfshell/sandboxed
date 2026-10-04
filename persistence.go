@@ -62,6 +62,11 @@ func (s *Store) load() error {
 	if err := validateManifest(value, int(h.ChunkSize)); err != nil {
 		return err
 	}
+	s.chunkSize, s.manifest = int(h.ChunkSize), value
+	if err := s.openWAL(false); err != nil {
+		return err
+	}
+	value = s.manifest
 	// Validate every live file before cleanup may delete anything.
 	for _, item := range value.Entries {
 		for _, part := range item.Chunks {
@@ -142,18 +147,16 @@ func validateManifest(value manifest, chunkSize int) error {
 // Published entries and their chunk slices are immutable. Writers copy the
 // target slice before editing, so unrelated entries can share their metadata.
 func cloneManifest(source manifest) manifest {
-	result := manifest{Entries: make(map[string]entry, len(source.Entries))}
+	result := manifest{Entries: make(map[string]entry, len(source.Entries)), Sequence: source.Sequence}
 	for name, item := range source.Entries {
 		result.Entries[name] = item
 	}
 	return result
 }
 
-// commit publishes only metadata. New chunk files have already been synced.
-// Once rename succeeds, memory follows the new manifest even if directory sync
-// or cleanup fails; returning an error must never restore stale references.
-// changed names identify entries whose chunk references may have changed.
-func (s *Store) commit(next manifest, changed ...string) error {
+// checkpoint persists the current committed view. WAL retirement is allowed
+// only after its replacement and directory entry are durable.
+func (s *Store) checkpoint(next manifest) error {
 	if err := validateManifest(next, s.chunkSize); err != nil {
 		return err
 	}
@@ -187,22 +190,8 @@ func (s *Store) commit(next manifest, changed ...string) error {
 	if err := unix.Renameat(int(s.root.Fd()), temporary.Name(), int(s.root.Fd()), "manifest"); err != nil {
 		return err
 	}
-	previous := s.manifest
-	s.manifest = next
 	s.manifestDirty = true
-	// Retain the new versions before releasing their source snapshots.
-	for _, name := range changed {
-		s.retain(next.Entries[name])
-	}
-	for _, name := range changed {
-		s.release(previous.Entries[name])
-	}
-	// Garbage must survive until the manifest rename is durable. A sync failure
-	// leaves it queued for a later cleanup, which retries the directory sync.
-	if err := s.syncManifest(); err != nil {
-		return err
-	}
-	return s.collect()
+	return s.syncManifest()
 }
 
 func (s *Store) temporary(prefix string) (*os.File, error) {
@@ -223,7 +212,7 @@ func (s *Store) retain(item entry) {
 	for _, part := range item.Chunks {
 		id := [32]byte(part.ID)
 		s.refs[id]++
-		delete(s.garbage, id)
+		s.forgetGarbage(id)
 	}
 }
 func (s *Store) release(item entry) {
@@ -232,7 +221,7 @@ func (s *Store) release(item entry) {
 		s.refs[id]--
 		if s.refs[id] == 0 {
 			delete(s.refs, id)
-			s.garbage[id] = struct{}{}
+			s.queueGarbage(id, int64(part.Size+16))
 		}
 	}
 }
@@ -254,6 +243,9 @@ func (s *Store) syncManifest() error {
 // collect is called with the store mutex held. Candidates come only from
 // released references or failed writes, never from currently staged writers.
 func (s *Store) collect() error {
+	if s.walErr != nil {
+		return s.walErr
+	}
 	if err := s.syncManifest(); err != nil {
 		return err
 	}
@@ -261,31 +253,43 @@ func (s *Store) collect() error {
 		return nil
 	}
 	var result error
+	remaining := cleanupBatch
 	for id := range s.garbage {
+		if remaining == 0 {
+			break
+		}
+		remaining--
 		if s.refs[id] != 0 {
-			delete(s.garbage, id)
+			s.forgetGarbage(id)
 			continue
 		}
 		if err := removeInternal(s.chunks, hex.EncodeToString(id[:])); err != nil {
 			result = errors.Join(result, err)
 			continue
 		}
-		delete(s.garbage, id)
+		s.forgetGarbage(id)
 	}
 	return errors.Join(result, s.chunks.Sync())
 }
 
-// Cleanup retries deletion of unused chunks. Normal commits and handle closes
-// already perform cleanup; referenced snapshots and active writes are preserved.
+// Cleanup drains deferred deletions in bounded passes, checking cancellation
+// between passes. Referenced snapshots and active writes are preserved.
 func (s *Store) Cleanup(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.lockLatest(); err != nil {
+			return err
+		}
+		err := s.collect()
+		more := len(s.garbage) != 0
+		s.cleanupErr = err
+		s.unlockLatest()
+		if err != nil || !more {
+			return err
+		}
 	}
-	if err := s.lockLatest(); err != nil {
-		return err
-	}
-	defer s.unlockLatest()
-	return s.collect()
 }
 
 // reconcile runs once under exclusive ownership, before handing out any handles.
@@ -305,7 +309,7 @@ func (s *Store) reconcile() error {
 	}
 	for _, file := range files {
 		name := file.Name()
-		if name == "manifest" || name == "lock" || name == "chunks" {
+		if name == "manifest" || name == "lock" || name == "chunks" || name == "wal" {
 			continue
 		}
 		id := strings.TrimPrefix(strings.TrimPrefix(name, ".staging-"), ".manifest-")
@@ -318,7 +322,14 @@ func (s *Store) reconcile() error {
 		decoded, _ := hex.DecodeString(entry.Name())
 		id := [32]byte(decoded)
 		if s.refs[id] == 0 {
-			s.garbage[id] = struct{}{}
+			file, info, err := openInternalWithInfo(s.chunks, entry.Name(), unix.O_RDONLY, 0)
+			if err != nil {
+				return err
+			}
+			if err := file.Close(); err != nil {
+				return err
+			}
+			s.queueGarbage(id, info.Size())
 		}
 	}
 	for _, file := range files {
@@ -327,6 +338,16 @@ func (s *Store) reconcile() error {
 				return err
 			}
 		}
+	}
+	// Repair only an incomplete tail after all live data and names validated.
+	if err := s.wal.Truncate(s.walSize); err != nil {
+		return err
+	}
+	if err := s.wal.Sync(); err != nil {
+		return err
+	}
+	if err := s.root.Sync(); err != nil {
+		return err
 	}
 	return s.collect()
 }
