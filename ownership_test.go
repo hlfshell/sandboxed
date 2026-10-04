@@ -37,6 +37,23 @@ func TestCrashOwnerHelper(t *testing.T) {
 	if _, err := writer.Write([]byte("staged")); err != nil {
 		t.Fatal(err)
 	}
+	// Persist a sparse layout, then leave a conflicting staged layout behind.
+	sparse, err := store.Create("sparse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeAt(t, sparse, []byte("committed"), 1<<30)
+	if err := sparse.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.Update("sparse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pending.Truncate(1 << 20); err != nil {
+		t.Fatal(err)
+	}
+	writeAt(t, pending, []byte("unfinished"), 1<<19)
 	fmt.Println("ready")
 	_, _ = io.Copy(io.Discard, os.Stdin)
 }
@@ -102,12 +119,22 @@ func TestProcessCrashReleasesOwnershipAndRecoversOrphans(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertFile(t, store, "file", []byte("new"))
-	if len(chunkFiles(t, store)) != 1 {
+	if len(chunkFiles(t, store)) != 2 {
 		t.Fatal("crashed reader's old chunks survived startup")
 	}
 	if _, err := store.Stat("unfinished"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("abandoned writer was published", err)
 	}
+	sparse, err := store.Open("sparse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sparse.Close()
+	info, err := sparse.Stat()
+	if err != nil || info.Size() != 1<<30+9 {
+		t.Fatal("uncommitted sparse size survived crash", info, err)
+	}
+	assertSparseWindow(t, sparse.(io.ReadSeeker), 1<<30-2, info.Size(), []sparsePatch{{1 << 30, []byte("committed")}})
 	entries, err := os.ReadDir(directory)
 	if err != nil {
 		t.Fatal(err)

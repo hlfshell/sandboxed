@@ -10,12 +10,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 )
 
 const (
 	headerSize      = 64
 	identifierSize  = 16
-	formatVersion   = 1
+	formatVersion   = 2
 	flagManifestAES = 1
 	maxManifestSize = 64 * 1024 * 1024
 )
@@ -42,6 +43,7 @@ type entry struct {
 }
 
 type chunk struct {
+	Index  int    `json:"index"`
 	ID     []byte `json:"id,omitempty"`
 	Offset int64  `json:"-"`
 	Size   int    `json:"size"`
@@ -182,6 +184,10 @@ func chunkKey(key, id []byte) []byte {
 // sealChunk creates a fresh encryption context even when a write is later
 // aborted or the same chunk is edited repeatedly.
 func sealChunk(fileKey []byte, index uint64, plain []byte) (chunk, []byte, error) {
+	return sealChunkInto(nil, fileKey, index, plain)
+}
+
+func sealChunkInto(buffer, fileKey []byte, index uint64, plain []byte) (chunk, []byte, error) {
 	id, err := randomKey()
 	if err != nil {
 		return chunk{}, nil, err
@@ -191,6 +197,16 @@ func sealChunk(fileKey []byte, index uint64, plain []byte) (chunk, []byte, error
 	if err != nil {
 		return chunk{}, nil, err
 	}
-	ciphertext := aead.Seal(nil, chunkNonce(key, index), plain, chunkAdditionalData(index, len(plain)))
-	return chunk{ID: id, Size: len(plain)}, ciphertext, nil
+	ciphertext := aead.Seal(buffer[:0], chunkNonce(key, index), plain, chunkAdditionalData(index, len(plain)))
+	return chunk{Index: int(index), ID: id, Size: len(plain)}, ciphertext, nil
+}
+
+// chunkPosition returns the record or insertion position in a committed layout.
+// Dense files retain direct lookup; sparse layouts search only allocated chunks.
+func (e entry) chunkPosition(index int) (int, bool) {
+	if index < len(e.Chunks) && e.Chunks[index].Index == index {
+		return index, true
+	}
+	position := sort.Search(len(e.Chunks), func(i int) bool { return e.Chunks[i].Index >= index })
+	return position, position < len(e.Chunks) && e.Chunks[position].Index == index
 }

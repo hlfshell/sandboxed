@@ -2,6 +2,7 @@ package sandboxed
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"io/fs"
 	"os"
@@ -22,6 +23,19 @@ func FuzzDecodeHeader(f *testing.F) {
 }
 
 func FuzzDecodeAndValidateManifest(f *testing.F) {
+	// Include valid sparse layouts so mutations reach index and span validation.
+	for _, allocated := range []bool{false, true} {
+		item := entry{Size: 1 << 30, Key: make([]byte, 32), Revision: make([]byte, 32)}
+		if allocated {
+			item.Chunks = []chunk{{Index: 17, Size: 7, ID: make([]byte, 32)}}
+		}
+		encoded, err := json.Marshal(manifest{Entries: map[string]entry{".": {Directory: true}, "sparse": item}})
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(encoded, defaultChunkSize)
+	}
+
 	f.Add([]byte(`{"entries":{".":{"directory":true}}}`), defaultChunkSize)
 	f.Add([]byte(`{"entries":{".":{"directory":true},"file":{"size":1,"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","chunks":[{"offset":0,"size":1}]}}}`), defaultChunkSize)
 	f.Add([]byte(`{"entries":null}`), defaultChunkSize)
@@ -97,5 +111,75 @@ func FuzzOpenStore(f *testing.F) {
 			return err
 		})
 		_ = err
+	})
+}
+
+// Exercise buffer reuse and staging-slot reuse against an independent byte model.
+func FuzzFileEditsMatchBytes(f *testing.F) {
+	f.Add([]byte{0, 255, 63, 7, 0, 0, 32, 9, 0, 130, 32, 5, 1, 10, 0, 0, 1, 200, 0, 0, 2, 130, 63, 0})
+	f.Add([]byte{0, 0, 32, 7, 0, 100, 32, 9, 1, 0, 0, 0, 3, 100, 16, 3})
+	f.Add([]byte{0, 0, 63, 1, 1, 1, 0, 0, 1, 100, 0, 0, 2, 0, 63, 0})
+
+	f.Fuzz(func(t *testing.T, operations []byte) {
+		if len(operations) > 256 {
+			t.Skip()
+		}
+		store := testStore(t)
+		file := createVirtual(t, store, "file")
+		var expected []byte
+
+		for i := 0; i+3 < len(operations); i += 4 {
+			operation := operations[i] % 4
+			offset := int(operations[i+1]) * 257
+			length := int(operations[i+2] % 64)
+			payload := bytes.Repeat([]byte{operations[i+3]}, length)
+
+			switch operation {
+			case 0, 3:
+				var n int
+				var err error
+				if operation == 0 {
+					n, err = file.WriteAt(payload, int64(offset))
+				} else {
+					if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
+						t.Fatal(err)
+					}
+					n, err = file.Write(payload)
+				}
+				if err != nil || n != length {
+					t.Fatalf("write: %d, %v", n, err)
+				}
+				if length != 0 {
+					if offset+length > len(expected) {
+						expected = append(expected, make([]byte, offset+length-len(expected))...)
+					}
+					copy(expected[offset:], payload)
+				}
+			case 1:
+				if err := file.Truncate(int64(offset)); err != nil {
+					t.Fatal(err)
+				}
+				if offset <= len(expected) {
+					expected = expected[:offset]
+				} else {
+					expected = append(expected, make([]byte, offset-len(expected))...)
+				}
+			case 2:
+				got := make([]byte, length)
+				n, err := file.ReadAt(got, int64(offset))
+				want := min(length, max(0, len(expected)-offset))
+				if n != want || (want < length && err != io.EOF) || (want == length && err != nil) {
+					t.Fatalf("read: %d/%d, %v", n, want, err)
+				}
+				if want > 0 && !bytes.Equal(got[:want], expected[offset:offset+want]) {
+					t.Fatal("staged read mismatch")
+				}
+			}
+		}
+
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+		assertFile(t, store, "file", expected)
 	})
 }

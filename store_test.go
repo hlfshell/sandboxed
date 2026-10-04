@@ -28,7 +28,7 @@ func TestHeaderUsesStructuredIdentifier(t *testing.T) {
 	if !bytes.Equal(headerBytes[11:14], []byte{0, 0, 0}) {
 		t.Fatalf("reserved bytes = %v", headerBytes[11:14])
 	}
-	if version := binary.BigEndian.Uint16(headerBytes[14:16]); version != 1 {
+	if version := binary.BigEndian.Uint16(headerBytes[14:16]); version != formatVersion {
 		t.Fatalf("format version = %d", version)
 	}
 }
@@ -641,7 +641,7 @@ func TestStoreRejectsUnsupportedFormatVersions(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for _, version := range []uint16{0, 2, 65535} {
+	for _, version := range []uint16{0, formatVersion + 1, 65535} {
 		raw := append([]byte(nil), original...)
 		binary.BigEndian.PutUint16(raw[14:16], version)
 		if err := os.WriteFile(filepath.Join(store.path, "manifest"), raw, 0600); err != nil {

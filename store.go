@@ -18,19 +18,20 @@ import (
 // Store owns a directory of encrypted chunks and a private manifest. Store implements
 // fs.FS, fs.ReadFileFS, fs.ReadDirFS, and fs.StatFS.
 type Store struct {
-	path      string
-	chunkSize int
-	key       []byte
-	fileMode  fs.FileMode
-	manifest  manifest
-	lock      sync.Mutex
-	root      *os.File
-	chunks    *os.File
-	owner     *os.File
-	refs      map[string]int
-	garbage   map[string]struct{}
-	handles   int
-	closed    bool
+	path          string
+	chunkSize     int
+	key           []byte
+	fileMode      fs.FileMode
+	manifest      manifest
+	lock          sync.Mutex
+	root          *os.File
+	chunks        *os.File
+	owner         *os.File
+	refs          map[[32]byte]int
+	garbage       map[[32]byte]struct{}
+	handles       int
+	closed        bool
+	manifestDirty bool
 }
 
 // ErrBusy means the store is already owned, or still has open file handles.
@@ -68,7 +69,16 @@ func OpenStore(directory string, options ...Option) (_ *Store, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("open store directory: %w", err)
 	}
-	store := &Store{path: directory, chunkSize: config.chunkSize, key: config.key, fileMode: config.fileMode, root: root, refs: make(map[string]int), garbage: make(map[string]struct{})}
+	store := &Store{
+		path:          directory,
+		chunkSize:     config.chunkSize,
+		key:           config.key,
+		fileMode:      config.fileMode,
+		root:          root,
+		refs:          make(map[[32]byte]int),
+		garbage:       make(map[[32]byte]struct{}),
+		manifestDirty: true,
+	}
 	defer func() {
 		if err != nil {
 			if store.chunks != nil {
@@ -181,7 +191,7 @@ func (s *Store) Mkdir(name string) error {
 	}
 	next := cloneManifest(s.manifest)
 	next.Entries[name] = entry{Directory: true}
-	return s.commit(next)
+	return s.commit(next, name)
 }
 
 // MkdirAll creates a directory and all missing parents.
@@ -237,7 +247,7 @@ func (s *Store) Remove(name string) error {
 	}
 	next := cloneManifest(s.manifest)
 	delete(next.Entries, name)
-	return s.commit(next)
+	return s.commit(next, name)
 }
 
 // WriteFile replaces name with data read through a bounded chunk buffer.

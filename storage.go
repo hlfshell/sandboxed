@@ -21,21 +21,28 @@ func openDirectory(name string) (*os.File, error) {
 }
 
 func openInternal(directory *os.File, name string, flags int, mode fs.FileMode) (*os.File, error) {
+	file, _, err := openInternalWithInfo(directory, name, flags, mode)
+	return file, err
+}
+
+// Return the same stat result used to reject unsafe internal file types so
+// callers validating ciphertext length do not need another filesystem call.
+func openInternalWithInfo(directory *os.File, name string, flags int, mode fs.FileMode) (*os.File, fs.FileInfo, error) {
 	fd, err := unix.Openat(int(directory.Fd()), name, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, uint32(mode.Perm()))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	file := os.NewFile(uintptr(fd), name)
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	if !info.Mode().IsRegular() {
 		file.Close()
-		return nil, fmt.Errorf("internal file %q is not regular", name)
+		return nil, nil, fmt.Errorf("internal file %q is not regular", name)
 	}
-	return file, nil
+	return file, info, nil
 }
 
 func removeInternal(directory *os.File, name string) error {

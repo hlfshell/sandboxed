@@ -19,7 +19,7 @@ import (
 var errMissingManifest = errors.New("missing store manifest")
 
 func (s *Store) load() error {
-	file, err := openInternal(s.root, "manifest", unix.O_RDONLY, 0)
+	file, info, err := openInternalWithInfo(s.root, "manifest", unix.O_RDONLY, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return errMissingManifest
 	}
@@ -27,10 +27,6 @@ func (s *Store) load() error {
 		return err
 	}
 	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return err
-	}
 	buffer := make([]byte, headerSize)
 	if _, err := io.ReadFull(file, buffer); err != nil {
 		return fmt.Errorf("read manifest header: %w", err)
@@ -69,13 +65,11 @@ func (s *Store) load() error {
 	// Validate every live file before cleanup may delete anything.
 	for _, item := range value.Entries {
 		for _, part := range item.Chunks {
-			file, err := openInternal(s.chunks, chunkName(part), unix.O_RDONLY, 0)
+			file, info, err := openInternalWithInfo(s.chunks, chunkName(part), unix.O_RDONLY, 0)
 			if err != nil {
 				return fmt.Errorf("open live chunk: %w", err)
 			}
-			info, statErr := file.Stat()
-			closeErr := file.Close()
-			if err := errors.Join(statErr, closeErr); err != nil {
+			if err := file.Close(); err != nil {
 				return err
 			}
 			if info.Size() != int64(part.Size+16) {
@@ -102,7 +96,7 @@ func validateManifest(value manifest, chunkSize int) error {
 	if !ok || !root.Directory {
 		return fmt.Errorf("store manifest has no root")
 	}
-	ids := make(map[string]struct{})
+	ids := make(map[[32]byte]struct{})
 	for name, item := range value.Entries {
 		if !fs.ValidPath(name) {
 			return fmt.Errorf("invalid virtual path %q", name)
@@ -119,35 +113,37 @@ func validateManifest(value manifest, chunkSize int) error {
 			}
 			continue
 		}
-		if len(item.Key) != 32 || len(item.Revision) != 32 || item.Size < 0 {
+		if len(item.Key) != 32 || len(item.Revision) != 32 || item.Size < 0 || item.Size > int64(chunkSize)*maxFileChunks {
 			return fmt.Errorf("invalid file metadata")
 		}
-		var size int64
-		for index, part := range item.Chunks {
-			if len(part.ID) != 32 || part.Size <= 0 || part.Size > chunkSize || (index < len(item.Chunks)-1 && part.Size != chunkSize) {
+		if len(item.Chunks) > maxFileChunks {
+			return fmt.Errorf("too many allocated chunks")
+		}
+		previous := -1
+		for _, part := range item.Chunks {
+			if len(part.ID) != 32 || part.Size <= 0 || part.Size > chunkSize || part.Index < 0 || part.Index >= maxFileChunks || part.Index <= previous {
 				return fmt.Errorf("invalid chunk metadata")
 			}
-			name := chunkName(part)
-			if _, exists := ids[name]; exists {
+			start := int64(part.Index) * int64(chunkSize)
+			if start >= item.Size || int64(part.Size) > item.Size-start {
+				return fmt.Errorf("chunk extends beyond file size")
+			}
+			id := [32]byte(part.ID)
+			if _, exists := ids[id]; exists {
 				return fmt.Errorf("duplicate chunk identity")
 			}
-			ids[name] = struct{}{}
-			if size > int64(^uint64(0)>>1)-int64(part.Size) {
-				return fmt.Errorf("file size overflow")
-			}
-			size += int64(part.Size)
-		}
-		if size != item.Size {
-			return fmt.Errorf("inconsistent file size")
+			ids[id] = struct{}{}
+			previous = part.Index
 		}
 	}
 	return nil
 }
 
+// Published entries and their chunk slices are immutable. Writers copy the
+// target slice before editing, so unrelated entries can share their metadata.
 func cloneManifest(source manifest) manifest {
 	result := manifest{Entries: make(map[string]entry, len(source.Entries))}
 	for name, item := range source.Entries {
-		item.Chunks = append([]chunk(nil), item.Chunks...)
 		result.Entries[name] = item
 	}
 	return result
@@ -156,7 +152,8 @@ func cloneManifest(source manifest) manifest {
 // commit publishes only metadata. New chunk files have already been synced.
 // Once rename succeeds, memory follows the new manifest even if directory sync
 // or cleanup fails; returning an error must never restore stale references.
-func (s *Store) commit(next manifest) error {
+// changed names identify entries whose chunk references may have changed.
+func (s *Store) commit(next manifest, changed ...string) error {
 	if err := validateManifest(next, s.chunkSize); err != nil {
 		return err
 	}
@@ -192,11 +189,17 @@ func (s *Store) commit(next manifest) error {
 	}
 	previous := s.manifest
 	s.manifest = next
-	s.addRefs(next)
-	s.dropRefs(previous)
+	s.manifestDirty = true
+	// Retain the new versions before releasing their source snapshots.
+	for _, name := range changed {
+		s.retain(next.Entries[name])
+	}
+	for _, name := range changed {
+		s.release(previous.Entries[name])
+	}
 	// Garbage must survive until the manifest rename is durable. A sync failure
 	// leaves it queued for a later cleanup, which retries the directory sync.
-	if err := s.root.Sync(); err != nil {
+	if err := s.syncManifest(); err != nil {
 		return err
 	}
 	return s.collect()
@@ -216,49 +219,58 @@ func (s *Store) addRefs(value manifest) {
 		s.retain(item)
 	}
 }
-func (s *Store) dropRefs(value manifest) {
-	for _, item := range value.Entries {
-		s.release(item)
-	}
-}
 func (s *Store) retain(item entry) {
 	for _, part := range item.Chunks {
-		name := chunkName(part)
-		s.refs[name]++
-		delete(s.garbage, name)
+		id := [32]byte(part.ID)
+		s.refs[id]++
+		delete(s.garbage, id)
 	}
 }
 func (s *Store) release(item entry) {
 	for _, part := range item.Chunks {
-		name := chunkName(part)
-		s.refs[name]--
-		if s.refs[name] == 0 {
-			delete(s.refs, name)
-			s.garbage[name] = struct{}{}
+		id := [32]byte(part.ID)
+		s.refs[id]--
+		if s.refs[id] == 0 {
+			delete(s.refs, id)
+			s.garbage[id] = struct{}{}
 		}
 	}
 }
 
-// collect is called with the store mutex held. Candidates come only from
-// released references or failed writes, never from currently staged writers.
-func (s *Store) collect() error {
-	if len(s.garbage) == 0 {
+// syncManifest records the durability barrier before any old chunks are
+// deleted. A successful commit already crossed this barrier; later handle
+// closes need not sync the same manifest again. Failures remain retryable.
+func (s *Store) syncManifest() error {
+	if !s.manifestDirty {
 		return nil
 	}
 	if err := s.root.Sync(); err != nil {
 		return err
 	}
+	s.manifestDirty = false
+	return nil
+}
+
+// collect is called with the store mutex held. Candidates come only from
+// released references or failed writes, never from currently staged writers.
+func (s *Store) collect() error {
+	if err := s.syncManifest(); err != nil {
+		return err
+	}
+	if len(s.garbage) == 0 {
+		return nil
+	}
 	var result error
-	for name := range s.garbage {
-		if s.refs[name] != 0 {
-			delete(s.garbage, name)
+	for id := range s.garbage {
+		if s.refs[id] != 0 {
+			delete(s.garbage, id)
 			continue
 		}
-		if err := removeInternal(s.chunks, name); err != nil {
+		if err := removeInternal(s.chunks, hex.EncodeToString(id[:])); err != nil {
 			result = errors.Join(result, err)
 			continue
 		}
-		delete(s.garbage, name)
+		delete(s.garbage, id)
 	}
 	return errors.Join(result, s.chunks.Sync())
 }
@@ -302,8 +314,11 @@ func (s *Store) reconcile() error {
 		}
 	}
 	for _, entry := range entries {
-		if s.refs[entry.Name()] == 0 {
-			s.garbage[entry.Name()] = struct{}{}
+		// Names were validated above before cleanup was allowed to begin.
+		decoded, _ := hex.DecodeString(entry.Name())
+		id := [32]byte(decoded)
+		if s.refs[id] == 0 {
+			s.garbage[id] = struct{}{}
 		}
 	}
 	for _, file := range files {
@@ -330,34 +345,49 @@ func randomKey() ([]byte, error) {
 }
 
 func (s *Store) readChunk(key []byte, index int, part chunk) ([]byte, error) {
-	file, err := openInternal(s.chunks, chunkName(part), unix.O_RDONLY, 0)
+	return s.readChunkInto(nil, key, index, part)
+}
+
+// readChunkInto authenticates ciphertext in reusable, handle-owned storage.
+func (s *Store) readChunkInto(buffer, key []byte, index int, part chunk) ([]byte, error) {
+	file, info, err := openInternalWithInfo(s.chunks, chunkName(part), unix.O_RDONLY, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open chunk: %w", err)
 	}
 	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
 	if info.Size() != int64(part.Size+16) {
 		return nil, fmt.Errorf("invalid chunk length")
 	}
-	ciphertext := make([]byte, part.Size+16)
+	ciphertext := resizeBuffer(buffer, part.Size+16)
 	if _, err := io.ReadFull(file, ciphertext); err != nil {
 		return nil, err
 	}
-	return decryptChunk(key, index, part, ciphertext)
+	return decryptChunkInto(ciphertext[:0], key, index, part, ciphertext)
 }
 
 func decryptChunk(fileKey []byte, index int, part chunk, ciphertext []byte) ([]byte, error) {
+	return decryptChunkInto(nil, fileKey, index, part, ciphertext)
+}
+
+func decryptChunkInto(buffer, fileKey []byte, index int, part chunk, ciphertext []byte) ([]byte, error) {
 	key := chunkKey(fileKey, part.ID)
 	aead, err := fileAEAD(key)
 	if err != nil {
 		return nil, err
 	}
-	plain, err := aead.Open(nil, chunkNonce(key, uint64(index)), ciphertext, chunkAdditionalData(uint64(index), part.Size))
+	plain, err := aead.Open(buffer, chunkNonce(key, uint64(index)), ciphertext, chunkAdditionalData(uint64(index), part.Size))
 	if err != nil {
 		return nil, fmt.Errorf("authenticate chunk: %w", err)
 	}
 	return plain, nil
+}
+
+// resizeBuffer preserves capacity between operations without retaining buffers
+// globally. Callers explicitly clear any newly exposed plaintext region.
+func resizeBuffer(buffer []byte, size int) []byte {
+	if cap(buffer) < size {
+		capacity := max(size, min(2*cap(buffer), maximumChunkSize+16))
+		return make([]byte, size, capacity)
+	}
+	return buffer[:size]
 }

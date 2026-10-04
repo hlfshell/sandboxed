@@ -2,7 +2,6 @@ package sandboxed
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"path"
@@ -20,6 +19,7 @@ type openFile struct {
 	chunkIndex int
 	plain      []byte
 	plainStart int64
+	plainEnd   int64
 	closed     bool
 }
 
@@ -61,6 +61,7 @@ func (f *openFile) Close() error {
 		return fs.ErrClosed
 	}
 	f.closed = true
+	f.plain = nil
 	f.store.lock.Lock()
 	defer f.store.lock.Unlock()
 	f.store.handles--
@@ -82,17 +83,19 @@ func (f *openFile) Read(p []byte) (int, error) {
 	// Decrypt at most one chunk at a time and copy from its plaintext window.
 	written := 0
 	for len(p) != 0 && f.offset < f.entry.Size {
-		index, start := f.chunkAt(f.offset)
-		if index < 0 {
-			return written, fmt.Errorf("read %q: invalid chunk index", f.name)
-		}
-		if f.chunkIndex != index {
+		if f.chunkIndex < 0 || f.offset < f.plainStart || f.offset >= f.plainEnd {
+			index, start := f.chunkAt(f.offset)
 			if err := f.loadChunk(index, start); err != nil {
 				return written, err
 			}
 		}
-		inside := int(f.offset - f.plainStart)
-		amount := copy(p, f.plain[inside:])
+		inside := f.offset - f.plainStart
+		amount := int(min(int64(len(p)), f.plainEnd-f.offset))
+		if inside < int64(len(f.plain)) {
+			amount = copy(p[:amount], f.plain[int(inside):])
+		} else {
+			clear(p[:amount])
+		}
 		p = p[amount:]
 		written += amount
 		f.offset += int64(amount)
@@ -126,25 +129,36 @@ func (f *openFile) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (f *openFile) chunkAt(offset int64) (int, int64) {
-	var start int64
-	for index, part := range f.entry.Chunks {
-		if offset < start+int64(part.Size) {
-			return index, start
-		}
-		start += int64(part.Size)
+	if offset < 0 || offset >= f.entry.Size {
+		return -1, f.entry.Size
 	}
-	return -1, start
+
+	// Logical positions are independent of the allocated record count.
+	size := int64(f.store.chunkSize)
+	index := int(offset / size)
+	return index, int64(index) * size
 }
 
 func (f *openFile) loadChunk(index int, start int64) error {
-	part := f.entry.Chunks[index]
-	plain, err := f.store.readChunk(f.entry.Key, index, part)
-	if err != nil {
-		return err
+	position, exists := f.entry.chunkPosition(index)
+	// Reusing the buffer invalidates the old cached window even on failure.
+	f.chunkIndex = -1
+	if !exists {
+		f.plain = f.plain[:0]
+		f.plainEnd = f.entry.Size
+		if position < len(f.entry.Chunks) {
+			f.plainEnd = int64(f.entry.Chunks[position].Index) * int64(f.store.chunkSize)
+		}
+	} else {
+		part := f.entry.Chunks[position]
+		plain, err := f.store.readChunkInto(f.plain, f.entry.Key, index, part)
+		if err != nil {
+			return err
+		}
+		f.plain = plain
+		f.plainEnd = min(start+int64(f.store.chunkSize), f.entry.Size)
 	}
-
-	f.chunkIndex, f.plainStart, f.plain = index, start, plain
-
+	f.chunkIndex, f.plainStart = index, start
 	return nil
 }
 

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"io"
 	"io/fs"
 	"os"
 	"path"
+	"sort"
 	"sync"
+
+	"golang.org/x/sys/unix"
 )
 
 // ErrConflict means the file changed after Create or Update captured its snapshot.
@@ -19,24 +21,30 @@ var ErrConflict = errors.New("file changed while open")
 // File is a virtual regular file with transactional writes. Read and Write share
 // a seek position; ReadAt and WriteAt do not change it. Close publishes changes
 // atomically and Abort discards them. Calls on a handle are serialized.
-// File never exposes a host filesystem handle. Gaps are stored as encrypted zeros.
-// Writable file sizes are limited to 524,288 chunks; the full store manifest
+// File never exposes a host filesystem handle. Unwritten regions read as zeros without allocating chunks.
+// Logical file sizes are limited to 524,288 chunk positions; the full store manifest
 // must also fit the 64 MiB metadata limit.
 type File struct {
-	mutex   sync.Mutex
-	store   *Store
-	source  *openFile
-	file    *os.File
-	item    entry
-	dirty   map[int]chunk
-	offset  int64
-	existed bool
-	changed bool
-	closed  bool
-	err     error
+	mutex     sync.Mutex
+	store     *Store
+	source    *openFile
+	file      *os.File
+	item      entry
+	dirty     map[int]chunk
+	positions map[int]int
+	offset    int64
+	existed   bool
+	changed   bool
+	closed    bool
+	err       error
+
+	// Scratch buffers are bounded by chunk size and never exposed to callers.
+	plain      []byte
+	ciphertext []byte
+	stagingEnd int64
 }
 
-// Reserve 128 bytes of manifest budget per chunk before accepting an offset.
+// Bound logical chunk positions and per-file metadata before accepting offsets.
 const maxFileChunks = maxManifestSize / 128
 
 var (
@@ -99,13 +107,14 @@ func (s *Store) openWritable(name string, replace bool) (*File, error) {
 		return nil, err
 	}
 
+	result.indexChunks()
 	s.handles++
 	s.retain(base)
 	return result, nil
 }
 
 // Write writes at the current position.
-// Writes beyond EOF fill the gap with encrypted zero bytes.
+// Writes beyond EOF leave unallocated, zero-filled gaps.
 func (f *File) Write(p []byte) (int, error) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
@@ -117,8 +126,8 @@ func (f *File) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// WriteAt stages p without changing the seek position. Gaps are filled with
-// encrypted zero bytes.
+// WriteAt immediately encrypts p without changing the seek position. Gaps
+// read as zeros without allocating payload chunks.
 func (f *File) WriteAt(p []byte, offset int64) (int, error) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
@@ -135,7 +144,7 @@ func (f *File) writable() error {
 	return f.err
 }
 
-// Bound the metadata implied by an offset before allocating or filling a gap.
+// Bound the logical file span independently of its allocated chunks.
 // The full manifest, including other files, is also bounded at commit.
 func (f *File) validSize(size int64) bool {
 	return size >= 0 && size <= int64(f.store.chunkSize)*maxFileChunks
@@ -173,13 +182,7 @@ func (f *File) grow(size int64) error {
 	if size <= f.item.Size {
 		return nil
 	}
-	zeros := make([]byte, f.store.chunkSize)
-	for f.item.Size < size {
-		amount := min(int64(len(zeros)), size-f.item.Size)
-		if _, err := f.writeChunk(zeros[:amount], f.item.Size); err != nil {
-			return err
-		}
-	}
+	f.item.Size, f.changed = size, true
 	return nil
 }
 
@@ -216,7 +219,13 @@ func (f *File) readAt(p []byte, offset int64) (int, error) {
 		if err != nil {
 			return written, err
 		}
-		amount := copy(p, plain[offset%int64(f.store.chunkSize):])
+		within := int(offset % int64(f.store.chunkSize))
+		amount := int(min(int64(len(p)), int64(f.store.chunkSize-within), f.item.Size-offset))
+		copied := 0
+		if within < len(plain) {
+			copied = copy(p[:amount], plain[within:])
+		}
+		clear(p[copied:amount])
 		written += amount
 		offset += int64(amount)
 		p = p[amount:]
@@ -228,15 +237,29 @@ func (f *File) readAt(p []byte, offset int64) (int, error) {
 }
 
 func (f *File) loadChunk(index int) ([]byte, error) {
-	part := f.item.Chunks[index]
-	if _, dirty := f.dirty[index]; !dirty {
-		return f.store.readChunk(f.item.Key, index, part)
+	position, exists := f.chunkPosition(index)
+	if !exists {
+		return nil, nil
 	}
-	ciphertext := make([]byte, part.Size+16)
+	part := f.item.Chunks[position]
+	if _, dirty := f.dirty[index]; !dirty {
+		plain, err := f.store.readChunkInto(f.plain, f.item.Key, index, part)
+		if err != nil {
+			return nil, err
+		}
+		f.plain = plain
+		return plain, nil
+	}
+	ciphertext := resizeBuffer(f.plain, part.Size+16)
 	if _, err := f.file.ReadAt(ciphertext, part.Offset); err != nil {
 		return nil, err
 	}
-	return decryptChunk(f.item.Key, index, part, ciphertext)
+	plain, err := decryptChunkInto(ciphertext[:0], f.item.Key, index, part, ciphertext)
+	if err != nil {
+		return nil, err
+	}
+	f.plain = plain
+	return plain, nil
 }
 
 // Seek sets the position used by Read and Write. Seeking beyond EOF does not
@@ -275,7 +298,8 @@ func (f *File) Stat() (fs.FileInfo, error) {
 }
 
 // Truncate changes the staged size without changing the seek position. Extending
-// fills with encrypted zeros. Shrinking discards data, including earlier writes.
+// creates unallocated zero-filled regions. Shrinking discards data, including
+// earlier writes; subsequent growth never restores discarded contents.
 func (f *File) Truncate(size int64) error {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
@@ -294,22 +318,31 @@ func (f *File) Truncate(size int64) error {
 	}
 	count := int((size + int64(f.store.chunkSize) - 1) / int64(f.store.chunkSize))
 	if tail := int(size % int64(f.store.chunkSize)); tail != 0 {
-		plain, err := f.loadChunk(count - 1)
-		if err != nil {
-			f.err = err
-			return err
-		}
-		if err := f.stageChunk(count-1, plain[:tail]); err != nil {
-			f.err = err
-			return err
-		}
-	}
-	f.item.Chunks = f.item.Chunks[:count]
-	for index := range f.dirty {
-		if index >= count {
-			delete(f.dirty, index)
+		position, exists := f.chunkPosition(count - 1)
+		if exists && f.item.Chunks[position].Size > tail {
+			plain, err := f.loadChunk(count - 1)
+			if err != nil {
+				f.err = err
+				return err
+			}
+			if err := f.stageChunk(count-1, plain[:tail]); err != nil {
+				f.err = err
+				return err
+			}
 		}
 	}
+
+	// Compact only allocated records, preserving private slot offsets for reuse.
+	kept := 0
+	for _, part := range f.item.Chunks {
+		if part.Index < count {
+			f.item.Chunks[kept] = part
+			kept++
+		}
+	}
+	clear(f.item.Chunks[kept:])
+	f.item.Chunks = f.item.Chunks[:kept]
+	f.indexChunks()
 	f.item.Size, f.changed = size, true
 	return nil
 }
@@ -318,19 +351,27 @@ func (f *File) writeChunk(p []byte, offset int64) (int, error) {
 	size := f.store.chunkSize
 	index, within := int(offset/int64(size)), int(offset%int64(size))
 	amount := min(len(p), size-within)
-	plain := make([]byte, within+amount)
 
-	// Authenticate the previous version, including earlier writes by this file handle.
-	if index < len(f.item.Chunks) {
-		previous, err := f.loadChunk(index)
+	// Authenticate the previous version before modifying its reusable buffer.
+	var previous []byte
+	if _, exists := f.chunkPosition(index); exists {
+		var err error
+		previous, err = f.loadChunk(index)
 		if err != nil {
 			return 0, err
 		}
-		if len(previous) > len(plain) {
-			plain = append(plain, make([]byte, len(previous)-len(plain))...)
-		}
+	}
+
+	length := max(len(previous), within+amount)
+	plain := resizeBuffer(f.plain, length)
+	if len(previous) != 0 {
 		copy(plain, previous)
 	}
+	// Only a gap needs zeroing; the incoming bytes overwrite the rest.
+	if within > len(previous) {
+		clear(plain[len(previous):within])
+	}
+	f.plain = plain
 	copy(plain[within:], p[:amount])
 
 	if err := f.stageChunk(index, plain); err != nil {
@@ -341,21 +382,40 @@ func (f *File) writeChunk(p []byte, offset int64) (int, error) {
 }
 
 func (f *File) stageChunk(index int, plain []byte) error {
-	part, ciphertext, err := sealChunk(f.item.Key, uint64(index), plain)
+	f.ciphertext = resizeBuffer(f.ciphertext, len(plain)+16)
+	part, ciphertext, err := sealChunkInto(f.ciphertext, f.item.Key, uint64(index), plain)
 	if err != nil {
 		return err
 	}
-	part.Offset, err = f.file.Seek(0, io.SeekEnd)
-	if err != nil {
-		return err
+	f.ciphertext = ciphertext
+
+	// A private fixed-capacity slot is rewritten with a fresh encryption context
+	// on every edit. Published chunks remain immutable and never share these slots.
+	previous, exists := f.dirty[index]
+	part.Offset = previous.Offset
+	if !exists {
+		part.Offset = f.stagingEnd
 	}
-	if _, err := f.file.Write(ciphertext); err != nil {
+	if _, err := f.file.WriteAt(ciphertext, part.Offset); err != nil {
 		return fmt.Errorf("stage file chunk: %w", err)
 	}
-	if index == len(f.item.Chunks) {
-		f.item.Chunks = append(f.item.Chunks, part)
+	if !exists {
+		f.stagingEnd += int64(f.store.chunkSize) + 16
+	}
+	position, exists := f.chunkPosition(index)
+	if exists {
+		f.item.Chunks[position] = part
 	} else {
-		f.item.Chunks[index] = part
+		if f.positions == nil && index != len(f.item.Chunks) {
+			f.positions = make(map[int]int, len(f.item.Chunks)+1)
+			for i, existing := range f.item.Chunks {
+				f.positions[existing.Index] = i
+			}
+		}
+		if f.positions != nil {
+			f.positions[index] = len(f.item.Chunks)
+		}
+		f.item.Chunks = append(f.item.Chunks, part)
 	}
 	f.dirty[index], f.changed = part, true
 	return nil
@@ -394,8 +454,9 @@ func (f *File) Close() (err error) {
 
 	// Publish each changed chunk under its immutable random name. Cleanup cannot
 	// run concurrently because this commit holds the store mutex.
-	for index, part := range f.dirty {
-		if index >= len(f.item.Chunks) {
+	published := false
+	for _, part := range f.item.Chunks {
+		if _, dirty := f.dirty[part.Index]; !dirty {
 			continue
 		}
 		name := chunkName(part)
@@ -403,24 +464,40 @@ func (f *File) Close() (err error) {
 		if err != nil {
 			return err
 		}
-		f.store.garbage[name] = struct{}{}
-		_, copyErr := io.CopyN(output, io.NewSectionReader(f.file, part.Offset, int64(part.Size+16)), int64(part.Size+16))
+		f.store.garbage[[32]byte(part.ID)] = struct{}{}
+		// Reuse encryption scratch for publication instead of allocating a copy
+		// buffer for every chunk. Hide optional copy methods that allocate their
+		// own buffers; all edits are complete and this scratch is now disposable.
+		length := int64(part.Size + 16)
+		buffer := f.ciphertext[:min(cap(f.ciphertext), f.store.chunkSize+16)]
+		reader := io.NewSectionReader(f.file, part.Offset, length)
+		n, copyErr := io.CopyBuffer(struct{ io.Writer }{output}, struct{ io.Reader }{reader}, buffer)
+		if copyErr == nil && n != length {
+			copyErr = io.ErrUnexpectedEOF
+		}
 		err = errors.Join(copyErr, output.Sync(), output.Close())
 		if err != nil {
 			return fmt.Errorf("publish chunk: %w", err)
 		}
+		published = true
 	}
-	if err := f.store.chunks.Sync(); err != nil {
-		return err
+	// Hole-only size changes publish metadata without a payload-directory change.
+	if published {
+		if err := f.store.chunks.Sync(); err != nil {
+			return err
+		}
 	}
 	revision, err := randomKey()
 	if err != nil {
 		return err
 	}
 	f.item.Revision = revision
+	if f.positions != nil {
+		sort.Slice(f.item.Chunks, func(i, j int) bool { return f.item.Chunks[i].Index < f.item.Chunks[j].Index })
+	}
 	next := cloneManifest(f.store.manifest)
 	next.Entries[f.source.name] = f.item
-	return f.store.commit(next)
+	return f.store.commit(next, f.source.name)
 }
 
 // Abort discards staged updates and releases resources. It is safe to defer,
@@ -436,5 +513,30 @@ func (f *File) Abort() error {
 }
 
 func (f *File) cleanup() error {
+	clear(f.plain[:cap(f.plain)])
+	f.plain, f.ciphertext = nil, nil
 	return errors.Join(f.file.Close(), removeInternal(f.store.root, f.file.Name()), f.source.Close())
+}
+
+// Writable layouts append newly allocated chunks in any order. Build an index
+// only for sparse layouts so random insertion stays O(1) without dense overhead.
+func (f *File) indexChunks() {
+	f.positions = nil
+	for i, part := range f.item.Chunks {
+		if part.Index != i {
+			f.positions = make(map[int]int, len(f.item.Chunks))
+			for position, part := range f.item.Chunks {
+				f.positions[part.Index] = position
+			}
+			return
+		}
+	}
+}
+
+func (f *File) chunkPosition(index int) (int, bool) {
+	if f.positions != nil {
+		position, exists := f.positions[index]
+		return position, exists
+	}
+	return index, index < len(f.item.Chunks)
 }
